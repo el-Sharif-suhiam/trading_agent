@@ -18,11 +18,19 @@ class AssetDataset:
             self.assets.append({"symbol":r.symbol,"features":feats,"close":close,"start":int(r.start_idx),"end":int(r.end_idx)})
         self.feature_count=self.assets[0]["features"].shape[1]
 
-    def sample(self, rng, steps):
-        a=self.assets[int(rng.integers(len(self.assets)))]
-        lo=a["start"]; hi=a["end"]-steps-1
-        start=int(rng.integers(lo, max(lo+1,hi+1)))
-        return a,start
+    def sample(self, rng, steps, window=0):
+        """Random episode start guaranteed to keep a full observation window
+        in the past and `steps` candles ahead, so no negative/wrapping slices."""
+        for _ in range(100):
+            a = self.assets[int(rng.integers(len(self.assets)))]
+            lo = a["start"] + window - 1
+            hi = a["end"] - steps - 1
+            if hi >= lo:
+                return a, int(rng.integers(lo, hi + 1))
+        raise RuntimeError(
+            f"No asset long enough for window={window} + steps={steps}; "
+            "download more history or reduce window/rollout_steps"
+        )
 
 
 def build(raw_dir, processed_dir, train_frac=.70, val_frac=.15, unseen_symbols=None):

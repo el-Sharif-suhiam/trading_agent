@@ -43,7 +43,10 @@ class FeatureEngine:
         for n in [12,24,48,96]:
             rh=x.high.rolling(n).max(); rl=x.low.rolling(n).min(); out[f"dist_high_{n}"]=(c-rh)/(c+1e-12); out[f"dist_low_{n}"]=(c-rl)/(c+1e-12); out[f"range_pos_{n}"]=(c-rl)/(rh-rl+1e-12)
         out["up_break_20"]=(c-x.high.shift(1).rolling(20).max())/(atr+1e-12); out["down_break_20"]=(c-x.low.shift(1).rolling(20).min())/(atr+1e-12)
-        swing_hi=x.high.rolling(5,center=True).max(); swing_lo=x.low.rolling(5,center=True).min(); out["swing_high_flag"]=(x.high>=swing_hi).astype(float); out["swing_low_flag"]=(x.low<=swing_lo).astype(float)
+        # Confirmed swing points only: a 5-candle swing needs 2 candles after it,
+        # so compare against the swing computed up to candle t-2 (no look-ahead).
+        swing_hi=x.high.rolling(5).max().shift(2); swing_lo=x.low.rolling(5).min().shift(2)
+        out["swing_high_flag"]=(x.high>=swing_hi).astype(float); out["swing_low_flag"]=(x.low<=swing_lo).astype(float)
         out["hh_hl_proxy"]=_slope(x.high.rolling(10).max(),10); out["ll_lh_proxy"]=_slope(x.low.rolling(10).min(),10)
         # Elliott-style: swing legs and Fibonacci relationships, expressed as hypotheses
         leg=c-c.shift(5); prev=c.shift(5)-c.shift(10); out["elliott_impulse_proxy"]=leg/(atr*5+1e-12); out["elliott_alternation"]=np.tanh((leg.abs()-prev.abs())/(atr*5+1e-12))
