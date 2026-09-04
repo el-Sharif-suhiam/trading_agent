@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "trading-agent": {
+        "type": "local",
+        "command": [".venv/bin/python", "-m", "src.mcp.server"],
+        "cwd": ".",
+        "timeout": 5000
+      }
+    }
+  }
+}

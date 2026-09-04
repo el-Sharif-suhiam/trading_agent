@@ -1,0 +1,8 @@
+numpy>=2.0,<3
+pandas>=2.2,<3
+scikit-learn>=1.5,<2
+gymnasium>=1.0,<2
+ccxt>=4.4,<5
+torch==2.6.0
+joblib>=1.4,<2
+mcp>=2,<3
