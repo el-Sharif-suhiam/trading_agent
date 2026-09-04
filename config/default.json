@@ -12,9 +12,10 @@
   "entropy_coef": 0.005,
   "value_coef": 0.5,
   "learning_rate": 0.0003,
+  "lr_final_factor": 0.1,
   "max_grad_norm": 0.5,
   "ppo_epochs": 4,
-  "minibatch_size": 1024,
+  "minibatch_size": 2,
   "hidden_size": 128,
   "encoder_size": 128,
   "num_gru_layers": 2,
@@ -26,5 +27,10 @@
   "data_dir": "data/raw",
   "processed_dir": "data/processed",
   "model_dir": "models",
-  "log_dir": "logs"
+  "log_dir": "logs",
+  "eval_every": 25,
+  "time_budget_hours": 8.0,
+  "patience_updates": 400,
+  "checkpoint_minutes": 5,
+  "max_kl": 0.02
 }

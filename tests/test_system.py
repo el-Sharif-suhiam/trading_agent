@@ -95,7 +95,7 @@ def test_ppo_update_runs_and_matches_rollout_axis():
     envs = [SpotTradingEnv(feats, c, 0, 2000, 96, 32) for _ in range(3)]
     for k, e in enumerate(envs): e.reset(seed=k, options={"start": 200+k})
     m = TradingAgent(8+4, encoder_size=32, hidden_size=32, num_gru_layers=1)
-    ppo = PPO(m, epochs=2, minibatch_size=2)
+    ppo = PPO(m, epochs=2, minibatch_size=2, max_kl=10.0)  # KL guard off for smoke test
     N, T = len(envs), 16
     obs = np.stack([e._obs() for e in envs])
     O = torch.empty(N, T, 96, 12); A = torch.empty(N, T)
