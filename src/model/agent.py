@@ -5,17 +5,15 @@ from torch.distributions import Beta
 class TradingAgent(nn.Module):
     """Window encoder -> GRU temporal memory -> Beta policy + value head.
 
-    A single observation is a window [W, F] of candles (each candle already
-    carries portfolio state columns). The encoder maps each candle to an
-    embedding, then the GRU consumes the sequence preserving intra-window
-    order. The policy head outputs Beta(alpha, beta) with alpha, beta > 0,
-    so target allocation can reach the full [0, 1] range.
+    Each observation is a window [W, F] of candles. The encoder embeds the
+    whole window into one vector **in candle order** (small GRU, not mean
+    pooling), then the decision GRU consumes the sequence of window embeddings
+    across decision steps. The policy head outputs Beta(alpha, beta) with
+    alpha, beta > 0, so target allocation can reach the full [0, 1] range.
     """
     def __init__(self, input_size, encoder_size=128, hidden_size=128, num_gru_layers=2):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_size, encoder_size), nn.LayerNorm(encoder_size), nn.Tanh(),
-            nn.Linear(encoder_size, encoder_size), nn.Tanh())
+        self.window_gru = nn.GRU(input_size, encoder_size, batch_first=True)
         self.gru = nn.GRU(encoder_size, hidden_size, num_layers=num_gru_layers, batch_first=True)
         self.policy = nn.Sequential(nn.Linear(hidden_size, 64), nn.Tanh())
         self.alpha = nn.Linear(64, 1)
@@ -29,16 +27,17 @@ class TradingAgent(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight); nn.init.constant_(m.bias, 0)
 
-    def encode_sequence(self, x):
-        # x: [B, T, W, F] -> [B, T*W, E] preserving candle order
+    def encode_windows(self, x):
+        # x: [B, T, W, F] -> window embeddings [B, T, E]
         b, t, w, f = x.shape
-        z = self.encoder(x.reshape(b, t*w, f))
-        return z
+        flat = x.reshape(b * t, w, f)
+        e, _ = self.window_gru(flat)
+        return e[:, -1].reshape(b, t, -1)
 
     def forward(self, x, h=None):
-        # x: [B, 1, W, F] or [B, T, W, F]
-        z = self.encode_sequence(x)
-        y, h = self.gru(z, h)
+        # x: [B, 1, W, F] single decision step
+        z = self.encode_windows(x)          # [B, 1, E]
+        y, h = self.gru(z, h)               # [B, 1, H], h carries memory
         q = self.policy(y[:, -1])
         alpha = torch.nn.functional.softplus(self.alpha(q)) + 0.05
         beta = torch.nn.functional.softplus(self.beta(q)) + 0.05
@@ -46,9 +45,9 @@ class TradingAgent(nn.Module):
         return Beta(alpha.squeeze(-1), beta.squeeze(-1)), value, h
 
     def forward_sequence(self, x, h=None):
-        # x: [B, T, W, F]; used by PPO updates, matches forward() step by step
-        z = self.encode_sequence(x)
-        y, h = self.gru(z, h)
+        # x: [B, T, W, F]; identical computation to T sequential forward() calls
+        z = self.encode_windows(x)           # [B, T, E]
+        y, h = self.gru(z, h)               # [B, T, H]
         q = self.policy(y)
         alpha = torch.nn.functional.softplus(self.alpha(q)) + 0.05
         beta = torch.nn.functional.softplus(self.beta(q)) + 0.05
