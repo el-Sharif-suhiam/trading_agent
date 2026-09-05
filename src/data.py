@@ -43,13 +43,13 @@ def main():
                    help="symbol=YYYY-MM-DD pairs; drop candles before this date for that symbol "
                         "(e.g. ICP/USDT=2022-01-11 to skip its first 8 listed months)")
     a = p.parse_args()
-    ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot", "fetchMarkets": ["spot"]}})
     ex.load_markets()
     os.makedirs(a.raw_dir, exist_ok=True)
     since = int(pd.Timestamp(a.since, tz="UTC").timestamp() * 1000)
     skips = {}
-    for item in (a.skip_until or []):
-        sym, date = item.split("=")
+    if a.skip_until:
+        sym, date = a.skip_until.split("=")
         skips[sym.upper()] = pd.Timestamp(date, tz="UTC")
     for symbol in a.symbols:
         if symbol not in ex.markets or not ex.markets[symbol].get("spot", True):

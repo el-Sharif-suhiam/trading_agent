@@ -1,0 +1,22 @@
+{
+  "feature_count": 92,
+  "assets": [
+    "data/raw/ALGO_USDT.csv",
+    "data/raw/APT_USDT.csv",
+    "data/raw/ARB_USDT.csv",
+    "data/raw/ATOM_USDT.csv",
+    "data/raw/AVAX_USDT.csv",
+    "data/raw/BNB_USDT.csv",
+    "data/raw/BTC_USDT.csv",
+    "data/raw/DOGE_USDT.csv",
+    "data/raw/ETH_USDT.csv",
+    "data/raw/ICP_USDT.csv",
+    "data/raw/INJ_USDT.csv",
+    "data/raw/LINK_USDT.csv",
+    "data/raw/NEAR_USDT.csv",
+    "data/raw/OP_USDT.csv",
+    "data/raw/SOL_USDT.csv",
+    "data/raw/SUI_USDT.csv",
+    "data/raw/XRP_USDT.csv"
+  ]
+}

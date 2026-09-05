@@ -24,6 +24,55 @@ def run(model, asset, cfg, device):
             "max_drawdown": info["drawdown"], "trades": info["trades"], "fees": info["fees"],
             "buy_hold": buyhold, "beat_buyhold": bool(info["portfolio_value"] >= buyhold)}
 
+
+def run_batch(model, assets, cfg, device, batch_size=16):
+    """Evaluate several assets in parallel by batching their envs step-by-step.
+    Produces identical results to run() (deterministic mean policy, same envs)."""
+    envs, starts, remaining = [], [], []
+    for asset in assets:
+        steps = asset["end"] - asset["start"] - cfg["window"] - 1
+        s = asset["start"] + cfg["window"] - 1
+        env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
+                             cfg["window"], max(1, steps), cfg["fee"], cfg["slippage"],
+                             cfg["initial_cash"])
+        env.reset(seed=1, options={"start": s})
+        envs.append(env); starts.append(s)
+    N = len(envs)
+    hs = None
+    active = list(range(N))
+    infos = [None] * N
+    obs = np.stack([e._obs() for e in envs])
+    while active:
+        with torch.no_grad():
+            x = torch.tensor(obs[:, None], device=device)  # [N, 1, W, F+4]
+            dist, _, hs = model(x, hs)
+            mean = (dist.concentration1 / (dist.concentration1 + dist.concentration0))
+            acts = mean.cpu().numpy()
+        nxt, still = [], []
+        for k, j in enumerate(active):
+            no, r, t, tr, info = envs[j].step(np.array([acts[k]], np.float32))
+            if t or tr: infos[j] = info
+            else: nxt.append(no); still.append(k)  # keep batch position k, not env id
+        if nxt:
+            obs = np.stack(nxt)
+            if hs is not None and len(still) < len(active):
+                idx = torch.tensor(still, device=device)
+                if isinstance(hs, tuple):
+                    hs = tuple(h[:, idx] for h in hs)
+                else:
+                    hs = hs[:, idx]
+        active = [active[k] for k in still]
+    results = []
+    for j, asset in enumerate(assets):
+        buyhold = cfg["initial_cash"] * (asset["close"][asset["end"] - 1] / asset["close"][starts[j]]) * (1 - cfg["fee"])
+        info = infos[j]
+        results.append({"final": info["portfolio_value"],
+                        "return_pct": (info["portfolio_value"] / cfg["initial_cash"] - 1) * 100,
+                        "max_drawdown": info["drawdown"], "trades": info["trades"],
+                        "fees": info["fees"], "buy_hold": buyhold,
+                        "beat_buyhold": bool(info["portfolio_value"] >= buyhold)})
+    return results
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="config/default.json")

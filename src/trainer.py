@@ -7,7 +7,7 @@ from .dataset import AssetDataset
 from .model import TradingAgent
 from .training.environment import SpotTradingEnv
 from .training.ppo import PPO
-from .evaluation.evaluate import run as eval_run
+from .evaluation.evaluate import run_batch as eval_run_batch
 
 
 class Trainer:
@@ -81,7 +81,7 @@ class Trainer:
 
     # ---------- validation ----------
     def validate(self):
-        rets = [eval_run(self.model, x, self.cfg, self.device) for x in self.val_ds.assets]
+        rets = eval_run_batch(self.model, self.val_ds.assets, self.cfg, self.device)
         return float(np.mean([r["return_pct"] for r in rets]))
 
     # ---------- checkpoints ----------
