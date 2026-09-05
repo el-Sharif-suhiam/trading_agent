@@ -118,7 +118,10 @@ class Trainer:
         deadline = time.time() + budget * 3600 if budget > 0 else None
         last_ckpt = time.time()
         patience = cfg.get("patience_updates", 0)
+        warmup = cfg.get("early_stop_warmup", 1000)  # no early-stop consideration before this
+        window = cfg.get("early_stop_window", 5)    # compare vs mean of last N evals, not raw best
         stale = 0
+        val_hist = []  # recent validation returns (for smoothed comparison)
         print(f"device={self.device} assets={len(self.train_ds.assets)} "
               f"features={self.train_ds.feature_count}+4 updates={cfg['updates']} "
               f"budget={budget or 'inf'}h  (touch {stop_file} to stop safely)")
@@ -143,14 +146,22 @@ class Trainer:
             if self.update_i % cfg.get("eval_every", 25) == 0:
                 vret = self.validate()
                 row[10] = round(vret, 3)
+                val_hist.append(vret)
                 if vret > self.best_val:
-                    self.best_val = vret; stale = 0
-                    self._save("best.pt")
-                else:
-                    stale += cfg.get("eval_every", 25)
-                if patience and stale >= patience:
-                    print(f"early stop: no val improvement in {stale} updates (best {self.best_val:.2f}%)")
-                    break
+                    self.best_val = vret; self._save("best.pt")
+                # smoothed early-stop: only after warmup, compare current eval
+                # against the mean of the previous `window` evals — a lucky
+                # single peak from the early unstable phase can't lock us out.
+                if patience and self.update_i >= warmup and len(val_hist) > window:
+                    recent_mean = float(np.mean(val_hist[-window-1:-1]))
+                    if vret <= recent_mean:
+                        stale += cfg.get("eval_every", 25)
+                    else:
+                        stale = 0
+                    if stale >= patience:
+                        print(f"early stop: no val improvement over recent mean "
+                              f"in {stale} updates (best {self.best_val:.2f}%)")
+                        break
             with open(self.csv_path, "a", newline="") as fh:
                 csv.writer(fh).writerow(row)
             print(f"update {self.update_i}/{cfg['updates']} portfolio={row[1]:.0f} "

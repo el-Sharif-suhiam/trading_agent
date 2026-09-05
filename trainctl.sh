@@ -22,7 +22,11 @@ case "${1:-help}" in
     HOURS="${2:-}"
     if is_running; then echo "already running (pid $(pgrep -f src.train | head -1)) — use stop first"; exit 1; fi
     ARGS="--config config/default.json"
-    [ "$1" = resume ] && ARGS="$ARGS --resume models/latest.pt"
+    if [ "$1" = resume ] || [ -f models/latest.pt ]; then
+      # resume if asked OR if a previous session left a checkpoint (prevents accidental restart-from-zero)
+      ARGS="$ARGS --resume models/latest.pt"
+      [ "$1" = start ] && echo "found models/latest.pt — resuming previous training (use kill+delete latest.pt to truly restart)"
+    fi
     [ -n "$HOURS" ] && ARGS="$ARGS --time-budget-hours $HOURS"
     rm -f "$STOP"
     nohup $PY -m src.train $ARGS >> "$TRAIN_LOG" 2>&1 &

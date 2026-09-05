@@ -5,7 +5,7 @@
   "episode_steps": 512,
   "num_envs": 32,
   "rollout_steps": 512,
-  "updates": 10000,
+  "updates": 40000,
   "gamma": 0.99,
   "gae_lambda": 0.95,
   "clip_coef": 0.2,
@@ -31,6 +31,8 @@
   "eval_every": 25,
   "time_budget_hours": 8.0,
   "patience_updates": 400,
+  "early_stop_warmup": 1000,
+  "early_stop_window": 5,
   "checkpoint_minutes": 5,
   "max_kl": 0.02
 }
