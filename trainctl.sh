@@ -25,6 +25,7 @@ case "${1:-help}" in
     [ "$1" = resume ] && ARGS="$ARGS --resume models/latest.pt"
     [ -n "$HOURS" ] && ARGS="$ARGS --time-budget-hours $HOURS"
     rm -f "$STOP"
+    # keep resume args simple: if models/latest.pt exists user should prefer 'resume'
     nohup $PY -m src.train $ARGS >> "$TRAIN_LOG" 2>&1 &
     echo "training started (pid $!) log: $TRAIN_LOG"
     ;;
@@ -54,6 +55,29 @@ case "${1:-help}" in
     ;;
   log)
     grep "^update" "$TRAIN_LOG" 2>/dev/null | tail -"${2:-15}" || echo "(no progress yet)"
+    ;;
+  help|--help|-h)
+    cat <<'EOF'
+trainctl.sh — control the training loop from the terminal
+
+Usage: ./trainctl.sh <command> [args]
+
+Commands:
+  start [hours]   Start training. Optional hours limit (default: config time_budget_hours)
+  resume [hours]  Resume from models/latest.pt (after stop/crash/power-off)
+  stop            Graceful stop: finishes current update, saves checkpoint, exits (~1 min)
+  kill            Hard kill (last resort; resume still works afterwards)
+  status          Running? + GPU usage + last progress line + last checkpoint update
+  watch           Live progress log (Ctrl+C exits watch, training keeps running)
+  log [N]         Show last N progress lines (default 15)
+  help            This help screen
+
+Examples:
+  ./trainctl.sh start 12     # train up to 12 hours
+  ./trainctl.sh stop         # safe stop
+  ./trainctl.sh resume 6     # continue where it stopped
+  ./trainctl.sh status       # check state anytime
+EOF
     ;;
   *)
     sed -n '2,10p' "$0"

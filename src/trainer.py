@@ -87,7 +87,9 @@ class Trainer:
     # ---------- checkpoints ----------
     def _ckpt(self):
         return {"model": self.model.state_dict(), "optimizer": self.ppo.opt.state_dict(),
-                "update": self.update_i, "best_val": self.best_val, "config": self.cfg}
+                "update": self.update_i, "best_val": self.best_val, "config": self.cfg,
+                "feature_count": self.train_ds.feature_count,
+                "state_dim": self.train_ds.feature_count + 4}
 
     def _save(self, name):
         torch.save(self._ckpt(), os.path.join(self.cfg["model_dir"], name))
