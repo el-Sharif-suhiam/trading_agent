@@ -25,9 +25,11 @@ case "${1:-help}" in
     [ "$1" = resume ] && ARGS="$ARGS --resume models/latest.pt"
     [ -n "$HOURS" ] && ARGS="$ARGS --time-budget-hours $HOURS"
     rm -f "$STOP"
-    # keep resume args simple: if models/latest.pt exists user should prefer 'resume'
     nohup $PY -m src.train $ARGS >> "$TRAIN_LOG" 2>&1 &
     echo "training started (pid $!) log: $TRAIN_LOG"
+    echo "opening dashboard (q to exit dashboard — training keeps running)..."
+    sleep 2
+    $PY tui.py
     ;;
   stop)
     if ! is_running; then echo "not running"; exit 1; fi
@@ -53,6 +55,10 @@ case "${1:-help}" in
   watch)
     tail -f "$TRAIN_LOG" 2>/dev/null || echo "no log yet — start training first"
     ;;
+  ui)
+    if ! command -v nvidia-smi > /dev/null; then echo "(nvidia-smi not found; GPU row will be hidden)"; fi
+    $PY tui.py
+    ;;
   log)
     grep "^update" "$TRAIN_LOG" 2>/dev/null | tail -"${2:-15}" || echo "(no progress yet)"
     ;;
@@ -69,6 +75,7 @@ Commands:
   kill            Hard kill (last resort; resume still works afterwards)
   status          Running? + GPU usage + last progress line + last checkpoint update
   watch           Live progress log (Ctrl+C exits watch, training keeps running)
+  ui              Graphical live dashboard in the terminal (charts, GPU, stats)
   log [N]         Show last N progress lines (default 15)
   help            This help screen
 
@@ -77,6 +84,7 @@ Examples:
   ./trainctl.sh stop         # safe stop
   ./trainctl.sh resume 6     # continue where it stopped
   ./trainctl.sh status       # check state anytime
+  ./trainctl.sh ui           # beautiful live dashboard
 EOF
     ;;
   *)
