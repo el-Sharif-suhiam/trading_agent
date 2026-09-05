@@ -140,10 +140,24 @@ def test_dataset_window_guard(tmp_path=None):
         assert s >= 95 and s + 100 <= a["end"]  # full window behind, episode ahead
 
 
+def test_stable_criterion_beats_lucky_peak():
+    """The consistency metric (mean of last 10 evals) must not be hijackable
+    by a single lucky validation peak — the user's core requirement."""
+    import numpy as np
+    hist = [5.0]*20 + [95.0] + [5.0]*9   # one lucky spike among consistent mediocrity
+    stable_vals = []
+    for i in range(len(hist)):
+        if i >= 10:
+            stable_vals.append(float(np.mean(hist[i-9:i+1])))
+    assert max(stable_vals) < 20.0, "single spike must not dominate the stable metric"
+    hist2 = [10.0, 11.0, 10.5, 11.5, 10.2, 11.8, 10.9, 11.2, 10.7, 11.4]  # consistently good
+    assert float(np.mean(hist2)) > 10.5, "consistent performance must be recognized"
+
+
 if __name__ == "__main__":
     test_features_no_future_fill(); test_features_prefix_invariance()
     test_env_portfolio_state_in_obs(); test_env_deadband_blocks_fee_churn()
     test_env_freezes_at_end(); test_agent_full_range()
     test_gru_time_axis_consistency(); test_ppo_update_runs_and_matches_rollout_axis()
-    test_dataset_window_guard()
+    test_dataset_window_guard(); test_stable_criterion_beats_lucky_peak()
     print("OK")

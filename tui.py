@@ -44,7 +44,7 @@ def parse_progress(lines):
                 d["update"] = upd; d["total"] = tot
                 for kv in parts[2:]:
                     k, _, v = kv.partition("=")
-                    if k in ("portfolio", "val", "best", "ent", "kl"):
+                    if k in ("portfolio", "val", "best", "stable", "ent", "kl"):
                         d[k] = v
                 d["sec"] = parts[-1]
             except Exception:
@@ -156,10 +156,14 @@ def draw(stdscr, interval):
                 fit_color(stdscr, y0, 2, f" update {prog.get('update','?')}/{prog.get('total','?')}", 5, curses.A_BOLD)
                 try: pf = float(prog.get('portfolio') or 10000)
                 except ValueError: pf = 10000.0
-                fit_color(stdscr, y0, 26, f"portfolio {prog.get('portfolio','?')}", 1 if pf >= 10000 else 2)
-                fit_color(stdscr, y0, 46, f"val {prog.get('val','-')}%", 4)
-                fit_color(stdscr, y0, 60, f"best {prog.get('best','?')}%", 1, curses.A_BOLD)
-                fit_color(stdscr, y0, 76, f"ent {prog.get('ent','?')}  kl {prog.get('kl','?')}", 5)
+                fit_color(stdscr, y0, 24, f"portfolio {prog.get('portfolio','?')}", 1 if pf >= 10000 else 2)
+                fit_color(stdscr, y0, 42, f"val {prog.get('val','-')}%", 4)
+                sv = prog.get('stable', '-')
+                try: svf = float(sv)
+                except (ValueError, TypeError): svf = -999
+                fit_color(stdscr, y0, 54, f"stable {sv}%", (1 if svf > 0 else 2), curses.A_BOLD)
+                fit_color(stdscr, y0, 70, f"best {prog.get('best','?')}%", 5)
+                fit_color(stdscr, y0, 84, f"ent {prog.get('ent','?')}", 5)
             else:
                 fit_color(stdscr, y0, 2, "(no progress lines yet — training just started or log empty)", 5)
 

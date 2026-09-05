@@ -27,6 +27,7 @@ class Trainer:
                        cfg["minibatch_size"], cfg.get("max_kl", 0.02))
         self.update_i = 0
         self.best_val = -np.inf
+        self.stable_val = -np.inf  # best 10-eval rolling mean (consistency criterion)
         if resume_path:
             self._load_checkpoint(resume_path)
 
@@ -35,7 +36,7 @@ class Trainer:
             with open(self.csv_path, "w", newline="") as fh:
                 csv.writer(fh).writerow(["update", "portfolio_mean", "trades", "reward_mean",
                                          "entropy", "value_loss", "policy_loss", "ratio_clip_frac",
-                                         "kl", "sec_per_update", "val_return_pct", "best_val_return_pct"])
+                                         "kl", "sec_per_update", "val_return_pct", "stable_val_return_pct"])
 
     # ---------- rollout ----------
     def _make_envs(self):
@@ -87,7 +88,8 @@ class Trainer:
     # ---------- checkpoints ----------
     def _ckpt(self):
         return {"model": self.model.state_dict(), "optimizer": self.ppo.opt.state_dict(),
-                "update": self.update_i, "best_val": self.best_val, "config": self.cfg,
+                "update": self.update_i, "best_val": self.best_val,
+                "stable_val": self.stable_val, "config": self.cfg,
                 "feature_count": self.train_ds.feature_count,
                 "state_dim": self.train_ds.feature_count + 4}
 
@@ -141,7 +143,8 @@ class Trainer:
             row = [self.update_i, round(np.mean(vals), 2), trades, round(R.mean().item(), 6),
                    stats.get("entropy"), stats.get("value_loss"), stats.get("policy_loss"),
                    stats.get("ratio_clip_frac"), stats.get("approx_kl"),
-                   round(time.time() - t0, 1), "", self.best_val if self.best_val > -np.inf else ""]
+                   round(time.time() - t0, 1), "",
+                   self.stable_val if self.stable_val > -np.inf else ""]
             # ---------- periodic validation / best checkpoint ----------
             if self.update_i % cfg.get("eval_every", 25) == 0:
                 vret = self.validate()
@@ -149,6 +152,14 @@ class Trainer:
                 val_hist.append(vret)
                 if vret > self.best_val:
                     self.best_val = vret; self._save("best.pt")
+                # consistency criterion: mean of last 10 evals.
+                # A model that scores ~the same every exam is worth far more
+                # than one that hit a lucky peak once.
+                if len(val_hist) >= 10:
+                    m = float(np.mean(val_hist[-10:]))
+                    if m > self.stable_val:
+                        self.stable_val = m
+                        self._save("stable.pt")
                 # smoothed early-stop: only after warmup, compare current eval
                 # against the mean of the previous `window` evals — a lucky
                 # single peak from the early unstable phase can't lock us out.
@@ -166,6 +177,7 @@ class Trainer:
                 csv.writer(fh).writerow(row)
             print(f"update {self.update_i}/{cfg['updates']} portfolio={row[1]:.0f} "
                   f"val={row[10] if row[10] != '' else '-'} best={self.best_val:.2f}% "
+                  f"stable={self.stable_val:.2f}% "
                   f"ent={stats.get('entropy')} kl={stats.get('approx_kl')} {row[9]}s", flush=True)
             last_ckpt = self._save_if_due(last_ckpt)
             if deadline and time.time() > deadline:
