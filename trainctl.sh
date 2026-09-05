@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# trainctl.sh — full control of training from the terminal, no external tools.
+# Usage:
+#   ./trainctl.sh start [hours]   # launch training (default hours from config: 8)
+#   ./trainctl.sh stop            # graceful stop: finishes current update, saves, exits
+#   ./trainctl.sh status          # is it running? + last progress line
+#   ./trainctl.sh watch           # live progress (Ctrl+C to exit, does NOT stop training)
+#   ./trainctl.sh kill            # hard kill (last resort; resume still works)
+#   ./trainctl.sh resume [hours]  # continue from models/latest.pt
+#   ./trainctl.sh log [N]         # last N progress lines (default 15)
+
+set -u
+cd "$(dirname "$0")"
+PY=.venv/bin/python
+TRAIN_LOG=logs/train.log
+STOP=logs/STOP
+
+is_running() { pgrep -f "src.trainer" > /dev/null 2>&1 || pgrep -f "src.train" > /dev/null 2>&1; }
+
+case "${1:-help}" in
+  start|resume)
+    HOURS="${2:-}"
+    if is_running; then echo "already running (pid $(pgrep -f src.train | head -1)) — use stop first"; exit 1; fi
+    ARGS="--config config/default.json"
+    [ "$1" = resume ] && ARGS="$ARGS --resume models/latest.pt"
+    [ -n "$HOURS" ] && ARGS="$ARGS --time-budget-hours $HOURS"
+    rm -f "$STOP"
+    nohup $PY -m src.train $ARGS >> "$TRAIN_LOG" 2>&1 &
+    echo "training started (pid $!) log: $TRAIN_LOG"
+    ;;
+  stop)
+    if ! is_running; then echo "not running"; exit 1; fi
+    touch "$STOP"
+    echo "stop requested — finishing current update, saving checkpoint, then exiting"
+    echo "(takes up to ~1 min; check with: ./trainctl.sh status)"
+    ;;
+  kill)
+    pkill -9 -f "src.trainer" 2>/dev/null; pkill -9 -f "src.train" 2>/dev/null
+    echo "hard-killed. resume later with: ./trainctl.sh resume"
+    ;;
+  status)
+    if is_running; then
+      echo "RUNNING (pid $(pgrep -f 'src.train|src.trainer' | head -1))"
+      nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | sed 's/^/GPU: /'
+    else
+      echo "NOT RUNNING"
+      [ -f models/latest.pt ] && echo "last checkpoint: update $($PY -c "import torch;print(torch.load('models/latest.pt',map_location='cpu',weights_only=False).get('update','?'))" 2>/dev/null)"
+    fi
+    echo "--- last progress:"
+    grep "^update" "$TRAIN_LOG" 2>/dev/null | tail -1 || echo "(no progress yet)"
+    ;;
+  watch)
+    tail -f "$TRAIN_LOG" 2>/dev/null || echo "no log yet — start training first"
+    ;;
+  log)
+    grep "^update" "$TRAIN_LOG" 2>/dev/null | tail -"${2:-15}" || echo "(no progress yet)"
+    ;;
+  *)
+    sed -n '2,10p' "$0"
+    ;;
+esac

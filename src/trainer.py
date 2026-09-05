@@ -109,6 +109,9 @@ class Trainer:
     # ---------- main loop ----------
     def train(self, time_budget_hours=None):
         cfg = self.cfg
+        stop_file = os.path.join(cfg["log_dir"], "STOP")
+        if os.path.exists(stop_file):
+            os.remove(stop_file)  # clear stale stop request from previous session
         budget = time_budget_hours if time_budget_hours is not None else cfg.get("time_budget_hours", 0)
         deadline = time.time() + budget * 3600 if budget > 0 else None
         last_ckpt = time.time()
@@ -116,8 +119,11 @@ class Trainer:
         stale = 0
         print(f"device={self.device} assets={len(self.train_ds.assets)} "
               f"features={self.train_ds.feature_count}+4 updates={cfg['updates']} "
-              f"budget={budget or 'inf'}h")
+              f"budget={budget or 'inf'}h  (touch {stop_file} to stop safely)")
         while self.update_i < cfg["updates"]:
+            if os.path.exists(stop_file):
+                print(f"stop requested via {stop_file}; saving and exiting cleanly")
+                break
             t0 = time.time()
             envs = self._make_envs()
             O, A, LP, R, V, D, last_v = self._rollout(envs)
@@ -142,7 +148,7 @@ class Trainer:
                     stale += cfg.get("eval_every", 25)
                 if patience and stale >= patience:
                     print(f"early stop: no val improvement in {stale} updates (best {self.best_val:.2f}%)")
-                    row and None
+                    break
             with open(self.csv_path, "a", newline="") as fh:
                 csv.writer(fh).writerow(row)
             print(f"update {self.update_i}/{cfg['updates']} portfolio={row[1]:.0f} "
@@ -152,7 +158,11 @@ class Trainer:
             if deadline and time.time() > deadline:
                 print(f"time budget of {budget}h reached at update {self.update_i}; stopping")
                 break
+            if os.path.exists(stop_file):
+                print("stop requested; saving and exiting cleanly")
+                break
         self._save("latest.pt")
+        os.path.exists(stop_file) and os.remove(stop_file)
         return self.update_i
 
     def _lr(self, base, final_factor, frac):
