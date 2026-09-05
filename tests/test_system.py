@@ -154,10 +154,103 @@ def test_stable_criterion_beats_lucky_peak():
     assert float(np.mean(hist2)) > 10.5, "consistent performance must be recognized"
 
 
+def _doctrine_env(closes):
+    """Env helper on a synthetic price path for doctrine tests.
+    All cash (position=0): portfolio value follows... nothing. To observe
+    mark-to-market waterfall we hold full position via action=1."""
+    import numpy as np
+    f = np.zeros((len(closes), 8), dtype=np.float32)
+    w = 4
+    e = SpotTradingEnv(f, np.asarray(closes, dtype=np.float64), 0, len(closes),
+                       window=w, episode_steps=len(closes)-w, min_trade_fraction=0.0)
+    return e
+
+
+def _run_env(e, start, action=1.0):
+    e.reset(options={"start": start})
+    info = None
+    while True:
+        _, _, t, tr, info = e.step(np.array([action], np.float32))
+        if t or tr: break
+    return info
+
+
+def test_doctrine_punishes_big_loss_vs_gains():
+    """User's exact scenario: 1000 won then 800 lost must have worse purity
+    than 1000 won then 300 lost (holding through both).
+    reset(start=3) -> entry at close[3]; value marks at close[4..]."""
+    import numpy as np
+    # entry at 100, rises to 110 (+10% = +1000 on 10k), then:
+    # A: falls to 102 => L≈8%  (1000 gain / 800 loss)
+    pathA = [100, 100, 100, 100, 110, 106, 102, 102, 102, 102]
+    # B: falls to 107 => L≈3%  (1000 gain / 300 loss)
+    pathB = [100, 100, 100, 100, 110, 108, 107, 107, 107, 107]
+    iA = _run_env(_doctrine_env(pathA), start=3)
+    iB = _run_env(_doctrine_env(pathB), start=3)
+    assert iA["purity"] < iB["purity"], f"1000/800 (p={iA['purity']:.2f}) must be punished harder than 1000/300 (p={iB['purity']:.2f})"
+
+
+def test_doctrine_bleed_penalty_grows_with_drawdown():
+    import numpy as np
+    e = _doctrine_env([100]*6)
+    e.reset(options={"start": 3})
+    # simulate peak rising first (as if portfolio climbed), then test depths
+    e.peak = 100.0; e.hwm = 100.0; e.trough = 100.0
+    p0 = e._bleed_penalty(100.0)      # no drawdown -> 0
+    p_small = e._bleed_penalty(99.6)  # 0.4% dip -> below bleed_start(0.5%) -> 0
+    p_mid = e._bleed_penalty(97.0)    # 3% dip -> some penalty
+    p_deep = e._bleed_penalty(93.0)   # 7% dip -> max penalty
+    assert p0 == 0.0 and p_small == 0.0
+    assert p_mid < 0 and p_deep < p_mid, "penalty must escalate with drawdown depth"
+
+
+def test_doctrine_equal_gain_loss_scores_worst():
+    """gain == loss must yield purity ~0, worse than any profitable ratio."""
+    import numpy as np
+    e = _doctrine_env([100, 100, 100, 100, 110, 105, 100, 100, 100])  # +10% then full retrace
+    info = _run_env(e, start=3)
+    assert abs(info["purity"]) < 0.35, f"equal gain and loss must be ~purity 0, got {info['purity']}"
+
+
+def test_crisis_sampling_finds_crashes():
+    """Crisis-biased sampling must locate the crash region of a synthetic asset."""
+    import os, tempfile
+    import numpy as np, pandas as pd
+    from src.dataset import AssetDataset
+    d = tempfile.mkdtemp()
+    n = 3000
+    closes = np.concatenate([np.linspace(100, 200, 1500), np.linspace(200, 60, 800), np.linspace(60, 90, 700)])
+    df = pd.DataFrame({"datetime": pd.date_range("2020-01-01", periods=n, freq="h", tz="UTC"),
+                       "close": closes})
+    for col in ["f1", "f2"]: df[col] = np.random.randn(n).astype(np.float32)
+    df.to_csv(os.path.join(d, "X_USDT_features.csv"), index=False)
+    pd.DataFrame([{"symbol": "X/USDT", "file": "X_USDT_features.csv",
+                   "start_idx": 0, "end_idx": n}]).to_csv(os.path.join(d, "train_manifest.csv"), index=False)
+    ds = AssetDataset(d, "train", window=16)
+    rng = np.random.default_rng(0)
+    crash_starts = set()
+    for _ in range(40):
+        a, s = ds.sample(rng, steps=100, window=16, crisis_bias=1.0)  # force crisis mode
+        crash_starts.add(s // 100)
+    # the crash spans roughly indices 1500-2300 -> starts//100 in 15..22
+    assert any(15 <= c <= 23 for c in crash_starts), f"crisis sampling missed crash: {sorted(crash_starts)}"
+
+
+def test_regime_classifier():
+    from src.evaluation.evaluate import classify_regime
+    up = np.linspace(100, 150, 100); dn = np.linspace(150, 90, 100); flat = np.full(100, 100.0)
+    assert classify_regime(up, 0, 100) == "up"
+    assert classify_regime(dn, 0, 100) == "down"
+    assert classify_regime(flat, 0, 100) == "sideways"
+
+
 if __name__ == "__main__":
     test_features_no_future_fill(); test_features_prefix_invariance()
     test_env_portfolio_state_in_obs(); test_env_deadband_blocks_fee_churn()
     test_env_freezes_at_end(); test_agent_full_range()
     test_gru_time_axis_consistency(); test_ppo_update_runs_and_matches_rollout_axis()
     test_dataset_window_guard(); test_stable_criterion_beats_lucky_peak()
+    test_doctrine_punishes_big_loss_vs_gains(); test_doctrine_bleed_penalty_grows_with_drawdown()
+    test_doctrine_equal_gain_loss_scores_worst(); test_crisis_sampling_finds_crashes()
+    test_regime_classifier()
     print("OK")

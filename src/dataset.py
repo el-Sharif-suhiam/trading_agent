@@ -18,19 +18,58 @@ class AssetDataset:
             self.assets.append({"symbol":r.symbol,"features":feats,"close":close,"start":int(r.start_idx),"end":int(r.end_idx)})
         self.feature_count=self.assets[0]["features"].shape[1]
 
-    def sample(self, rng, steps, window=0):
-        """Random episode start guaranteed to keep a full observation window
-        in the past and `steps` candles ahead, so no negative/wrapping slices."""
+    def sample(self, rng, steps, window=0, crisis_bias=0.0, close=None):
+        """Random episode start; with probability crisis_bias, sample from the
+        worst historical drawdown windows (crash training) using the close
+        price series to locate them dynamically."""
         for _ in range(100):
             a = self.assets[int(rng.integers(len(self.assets)))]
             lo = a["start"] + window - 1
             hi = a["end"] - steps - 1
-            if hi >= lo:
-                return a, int(rng.integers(lo, hi + 1))
+            if hi < lo:
+                continue
+            if crisis_bias > 0 and rng.random() < crisis_bias:
+                s = self._crisis_start(rng, a, steps, window)
+                if s is not None:
+                    return a, s
+            return a, int(rng.integers(lo, hi + 1))
         raise RuntimeError(
             f"No asset long enough for window={window} + steps={steps}; "
             "download more history or reduce window/rollout_steps"
         )
+
+    def _crisis_start(self, rng, a, steps, window):
+        """Locate severe drawdown regions in this asset's close series and
+        sample an episode start inside one. Returns None if no crisis found
+        (e.g. mostly flat asset)."""
+        if not hasattr(self, "_crisis_cache"):
+            self._crisis_cache = {}
+        key = (a["symbol"],)
+        if key not in self._crisis_cache:
+            c = a["close"]
+            # rolling max drawdown over ~30 days (720h) on the train range only
+            lookback = 720
+            s = a["start"]; e = a["end"]
+            idx = np.arange(s, e)
+            if len(idx) < lookback + steps:
+                self._crisis_cache[key] = None
+                return None
+            roll_max = np.maximum.accumulate(c[idx])
+            dd = 1.0 - c[idx]/np.maximum(roll_max, 1e-12)
+            # crisis = regions where drawdown exceeded 25% from running peak
+            crisis_mask = dd > 0.25
+            self._crisis_cache[key] = (idx, crisis_mask)
+        cached = self._crisis_cache[key]
+        if cached is None:
+            return None
+        idx, mask = cached
+        candidates = idx[mask]
+        # need a full window behind and steps ahead within the asset range
+        valid = [i for i in candidates
+                 if i - (window-1) >= a["start"] and i + steps < a["end"]]
+        if not valid:
+            return None
+        return int(valid[rng.integers(len(valid))])
 
 
 def build(raw_dir, processed_dir, train_frac=.70, val_frac=.15, unseen_symbols=None):

@@ -41,12 +41,19 @@ class Trainer:
     # ---------- rollout ----------
     def _make_envs(self):
         cfg = self.cfg; envs = []
+        crisis_bias = cfg.get("crisis_bias", 0.15)
         for k in range(cfg["num_envs"]):
             rng = np.random.default_rng(cfg["seed"] + self.update_i * 1000 + k)
-            asset, s = self.train_ds.sample(rng, cfg["episode_steps"], cfg["window"])
+            asset, s = self.train_ds.sample(rng, cfg["episode_steps"], cfg["window"],
+                                            crisis_bias=crisis_bias)
             env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
                                  cfg["window"], cfg["rollout_steps"], cfg["fee"], cfg["slippage"],
-                                 cfg["initial_cash"])
+                                 cfg["initial_cash"],
+                                 bleed_start=cfg.get("bleed_start", 0.005),
+                                 bleed_max=cfg.get("bleed_max", 0.05),
+                                 bleed_penalty=cfg.get("bleed_penalty", 1.5),
+                                 purity_coef=cfg.get("purity_coef", 0.8),
+                                 trend_patience_coef=cfg.get("trend_patience_coef", 0.15))
             env.reset(seed=cfg["seed"] + self.update_i * 1000 + k, options={"start": s})
             envs.append(env)
         return envs
@@ -82,8 +89,13 @@ class Trainer:
 
     # ---------- validation ----------
     def validate(self):
+        """Returns (mean_return_pct, mean_purity). Purity = (G-L)/(G+L) averaged
+        over assets — the user's doctrine: gains must dwarf losses."""
         rets = eval_run_batch(self.model, self.val_ds.assets, self.cfg, self.device)
-        return float(np.mean([r["return_pct"] for r in rets]))
+        # purity comes from env info; run_batch exposes it via final infos
+        pur = [r.get("purity", 0.0) for r in rets]
+        return (float(np.mean([r["return_pct"] for r in rets])),
+                float(np.mean(pur)) if pur else 0.0)
 
     # ---------- checkpoints ----------
     def _ckpt(self):
@@ -147,7 +159,7 @@ class Trainer:
                    self.stable_val if self.stable_val > -np.inf else ""]
             # ---------- periodic validation / best checkpoint ----------
             if self.update_i % cfg.get("eval_every", 25) == 0:
-                vret = self.validate()
+                vret, vpurity = self.validate()
                 row[10] = round(vret, 3)
                 val_hist.append(vret)
                 if vret > self.best_val:
@@ -157,8 +169,12 @@ class Trainer:
                 # than one that hit a lucky peak once.
                 if len(val_hist) >= 10:
                     m = float(np.mean(val_hist[-10:]))
-                    if m > self.stable_val:
-                        self.stable_val = m
+                    # doctrine-weighted score: return must come with purity
+                    # (gains dwarfing losses). Purity in [-1,1] boosts or
+                    # discounts the raw return mean.
+                    score = m * (0.5 + 0.5 * max(0.0, vpurity))
+                    if score > self.stable_val:
+                        self.stable_val = score
                         self._save("stable.pt")
                 # smoothed early-stop: only after warmup, compare current eval
                 # against the mean of the previous `window` evals — a lucky
