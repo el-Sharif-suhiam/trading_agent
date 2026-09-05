@@ -39,15 +39,26 @@ def main():
     d.add_argument("--timeframe", default="1h")
     d.add_argument("--since", default="2020-01-01")
     d.add_argument("--raw-dir", default="data/raw")
-    a = d.parse_args()
+    d.add_argument("--skip-until", default="",
+                   help="symbol=YYYY-MM-DD pairs; drop candles before this date for that symbol "
+                        "(e.g. ICP/USDT=2022-01-11 to skip its first 8 listed months)")
+    a = p.parse_args()
     ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     ex.load_markets()
     os.makedirs(a.raw_dir, exist_ok=True)
     since = int(pd.Timestamp(a.since, tz="UTC").timestamp() * 1000)
+    skips = {}
+    for item in (a.skip_until or []):
+        sym, date = item.split("=")
+        skips[sym.upper()] = pd.Timestamp(date, tz="UTC")
     for symbol in a.symbols:
         if symbol not in ex.markets or not ex.markets[symbol].get("spot", True):
             raise ValueError(f"Unsupported Binance Spot symbol: {symbol}")
         df = fetch_symbol(ex, symbol, a.timeframe, since)
+        if symbol.upper() in skips:
+            before = len(df)
+            df = df[df.datetime >= skips[symbol.upper()]].reset_index(drop=True)
+            print(f"{symbol}: dropped {before - len(df)} candles before {skips[symbol.upper()].date()}")
         name = symbol.replace("/", "_") + ".csv"
         df.to_csv(os.path.join(a.raw_dir, name), index=False)
         print(symbol, len(df), df.datetime.iloc[0], df.datetime.iloc[-1])
