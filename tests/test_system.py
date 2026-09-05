@@ -244,6 +244,94 @@ def test_regime_classifier():
     assert classify_regime(flat, 0, 100) == "sideways"
 
 
+def test_inactivity_bias_punishes_pure_cash():
+    """100% cash every step must accumulate negative shaping — the coward
+    equilibrium (never trade) is mathematically dominated."""
+    e = _doctrine_env([100, 100, 100, 100, 100, 100, 100, 100])
+    e.reset(options={"start": 3})
+    rewards = []
+    while True:
+        _, r, t, tr, _ = e.step(np.array([0.0], np.float32))
+        rewards.append(r)
+        if t or tr: break
+    assert sum(rewards) < 0, "sitting in cash forever must cost something"
+
+
+def test_peak_ambition_rewards_new_highs_only():
+    """Bonus fires on new highs, is capped, and doesn't repeat on flat."""
+    e = _doctrine_env([100, 100, 100, 100, 110, 110, 110, 121, 121])
+    e.reset(options={"start": 3})
+    while True:
+        _, _, t, tr, _ = e.step(np.array([1.0], np.float32))
+        if t or tr: break
+    # entered at 100% -> value follows price; new highs at 110 and 121
+    assert e.peak_count >= 2, f"each new portfolio high must count as ambition, got {e.peak_count}"
+
+
+def test_ecstasy_fades_with_mastery():
+    """Same-sized wins should produce smaller ecstasy over time (EMA adapts):
+    progressive ambition — the same thrill demands bigger feats."""
+    import numpy as np
+    from src.training.environment import SpotTradingEnv
+    f = np.zeros((30, 8), np.float32)
+    e = SpotTradingEnv(f, np.full(30, 100.0), 0, 30, window=4, episode_steps=26)
+    e.reset(options={"start": 3})
+    e.ret_ema = 0.0
+    first = e._ecstasy(0.05)
+    e.ret_ema = 0.049   # mastered: now expects ~this return
+    faded = e._ecstasy(0.05)
+    assert first > faded, "identical returns must thrill less once expected"
+
+
+def test_survival_bonus_for_fleeing_before_crash():
+    """Being in cash while the market crashes must pay the survival bonus."""
+    import numpy as np
+    from src.training.environment import SpotTradingEnv
+    # flat, then a cliff at the end; agent stays in cash
+    path = [100]*12 + [100, 100, 100, 94.0, 94.0, 94.0, 94.0, 94.0]
+    f = np.zeros((len(path), 8), np.float32)
+    e = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
+                       window=4, episode_steps=len(path)-5)
+    e.reset(options={"start": 3})
+    survived = 0.0
+    while True:
+        _, r, t, tr, info = e.step(np.array([0.0], np.float32))
+        if t or tr: break
+    # the step where price dropped 6% while agent in cash must have rewarded
+    assert e._survival_check.__doc__ is not None  # sanity
+    # direct check: simulate one crash step
+    e._prev_close = 100.0
+    e.i = 15  # close[15]=94 -> drop of 6%
+    assert e._survival_check() > 0, "fleeing before a 6% crash must pay"
+
+
+def test_timing_bonus_for_surgical_entry():
+    """Entry that keeps improving for `timing_horizon` candles earns bonus.
+    Step consumes pending entries internally, so we evaluate the mechanism
+    directly on a fresh env to keep the unit test pure."""
+    import numpy as np
+    from src.training.environment import SpotTradingEnv
+    path = [100, 100, 100, 100, 98, 99, 100, 101, 102, 103, 104, 105]
+    f = np.zeros((len(path), 8), np.float32)
+    e = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
+                       window=4, episode_steps=len(path)-5, timing_horizon=4)
+    e.reset(options={"start": 3})
+    e._register_entry(100.0)                      # surgical entry at the dip
+    e._pending[0]["step"] = e.steps - 10          # force it to be matured
+    e.i = 11                                      # price now 105
+    bonus = e._resolve_timing()
+    assert bonus > 0, f"surgical entry must earn timing bonus, got {bonus}"
+    assert bonus <= e.ecstasy_cap, "timing bonus must be capped"
+    # a doomed entry (price below entry after horizon) earns nothing
+    e2 = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
+                        window=4, episode_steps=len(path)-5, timing_horizon=4)
+    e2.reset(options={"start": 3})
+    e2._register_entry(105.0)                     # bought the top
+    e2._pending[0]["step"] = e2.steps - 10
+    e2.i = 11
+    assert e2._resolve_timing() == 0.0, "entry that fell must earn no timing bonus"
+
+
 if __name__ == "__main__":
     test_features_no_future_fill(); test_features_prefix_invariance()
     test_env_portfolio_state_in_obs(); test_env_deadband_blocks_fee_churn()
@@ -252,5 +340,7 @@ if __name__ == "__main__":
     test_dataset_window_guard(); test_stable_criterion_beats_lucky_peak()
     test_doctrine_punishes_big_loss_vs_gains(); test_doctrine_bleed_penalty_grows_with_drawdown()
     test_doctrine_equal_gain_loss_scores_worst(); test_crisis_sampling_finds_crashes()
-    test_regime_classifier()
+    test_regime_classifier(); test_inactivity_bias_punishes_pure_cash()
+    test_peak_ambition_rewards_new_highs_only(); test_ecstasy_fades_with_mastery()
+    test_survival_bonus_for_fleeing_before_crash(); test_timing_bonus_for_surgical_entry()
     print("OK")

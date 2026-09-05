@@ -49,11 +49,15 @@ class Trainer:
             env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
                                  cfg["window"], cfg["rollout_steps"], cfg["fee"], cfg["slippage"],
                                  cfg["initial_cash"],
-                                 bleed_start=cfg.get("bleed_start", 0.005),
+                                 bleed_start=cfg.get("bleed_start", 0.012),
                                  bleed_max=cfg.get("bleed_max", 0.05),
-                                 bleed_penalty=cfg.get("bleed_penalty", 1.5),
-                                 purity_coef=cfg.get("purity_coef", 0.8),
-                                 trend_patience_coef=cfg.get("trend_patience_coef", 0.15))
+                                 bleed_penalty=cfg.get("bleed_penalty", 0.35),
+                                 purity_coef=cfg.get("purity_coef", 0.25),
+                                 trend_patience_coef=cfg.get("trend_patience_coef", 0.15),
+                                 ecstasy_cap=cfg.get("ecstasy_cap", 0.2),
+                                 timing_horizon=cfg.get("timing_horizon", 8),
+                                 survival_bonus=cfg.get("survival_bonus", 0.3),
+                                 peak_ambition_coef=cfg.get("peak_ambition_coef", 0.5))
             env.reset(seed=cfg["seed"] + self.update_i * 1000 + k, options={"start": s})
             envs.append(env)
         return envs
@@ -131,11 +135,7 @@ class Trainer:
         budget = time_budget_hours if time_budget_hours is not None else cfg.get("time_budget_hours", 0)
         deadline = time.time() + budget * 3600 if budget > 0 else None
         last_ckpt = time.time()
-        patience = cfg.get("patience_updates", 0)
-        warmup = cfg.get("early_stop_warmup", 1000)  # no early-stop consideration before this
-        window = cfg.get("early_stop_window", 5)    # compare vs mean of last N evals, not raw best
-        stale = 0
-        val_hist = []  # recent validation returns (for smoothed comparison)
+        val_hist = []  # recent validation returns (consistency tracking)
         print(f"device={self.device} assets={len(self.train_ds.assets)} "
               f"features={self.train_ds.feature_count}+4 updates={cfg['updates']} "
               f"budget={budget or 'inf'}h  (touch {stop_file} to stop safely)")
@@ -176,19 +176,9 @@ class Trainer:
                     if score > self.stable_val:
                         self.stable_val = score
                         self._save("stable.pt")
-                # smoothed early-stop: only after warmup, compare current eval
-                # against the mean of the previous `window` evals — a lucky
-                # single peak from the early unstable phase can't lock us out.
-                if patience and self.update_i >= warmup and len(val_hist) > window:
-                    recent_mean = float(np.mean(val_hist[-window-1:-1]))
-                    if vret <= recent_mean:
-                        stale += cfg.get("eval_every", 25)
-                    else:
-                        stale = 0
-                    if stale >= patience:
-                        print(f"early stop: no val improvement over recent mean "
-                              f"in {stale} updates (best {self.best_val:.2f}%)")
-                        break
+                # NOTE: no early stop. The system NEVER decides it cannot
+                # improve — it saves its best state and keeps trying with
+                # everything it has (user's explicit requirement).
             with open(self.csv_path, "a", newline="") as fh:
                 csv.writer(fh).writerow(row)
             print(f"update {self.update_i}/{cfg['updates']} portfolio={row[1]:.0f} "
