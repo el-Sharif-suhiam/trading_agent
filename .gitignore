@@ -9,3 +9,4 @@ logs/*.log
 logs/state.json
 models/bench/
 logs/bench/
+logs/
