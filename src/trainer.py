@@ -135,8 +135,17 @@ class Trainer:
 
     def _load_checkpoint(self, path):
         ck = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ck["model"])
-        self.ppo.opt.load_state_dict(ck["optimizer"])
+        state = ck["model"]
+        # strip torch.compile's _orig_mod. prefix if present (checkpoint
+        # may come from a compiled or eager session)
+        if any(k.startswith("_orig_mod.") for k in state):
+            state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+        # or add it if the running model is compiled
+        if any(not k.startswith("_orig_mod.") for k in state) and hasattr(self.model, "_orig_mod"):
+            state = {f"_orig_mod.{k}": v for k, v in state.items()}
+        self.model.load_state_dict(state)
+        if "optimizer" in ck:  # distilled checkpoints have no optimizer state
+            self.ppo.opt.load_state_dict(ck["optimizer"])
         self.update_i = ck.get("update", 0)
         self.best_val = ck.get("best_val", -np.inf)
         self.stable_val = ck.get("stable_val", -np.inf)
