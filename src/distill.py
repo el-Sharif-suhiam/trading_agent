@@ -120,9 +120,12 @@ def distill(teacher_path, out_path, cfg, device, epochs=6, batches=200,
             batch=32, seq_len=32, lr=3e-4):
     ds = AssetDataset(cfg["processed_dir"], "train", cfg["window"])
     ck = torch.load(teacher_path, map_location=device, weights_only=False)
-    # the teacher must be built with ITS OWN config (v2: reviewer-less, 3 frames)
+    # the teacher must be built with ITS OWN config (v2: reviewer-less,
+    # 3 frames) and ITS OWN feature count (the checkpoint predates the
+    # XGB columns — it expects 92 market features + 5 state cols).
     tcfg = ck.get("config", cfg)
-    teacher = v2_agent(ds.feature_count, tcfg).to(device)
+    teacher_sd = ck.get("state_dim", ds.feature_count + 5)  # teacher obs width
+    teacher = v2_agent(teacher_sd - 5, tcfg).to(device)
     state = {k.replace("_orig_mod.", "", 1): v for k, v in ck["model"].items()}
     teacher.load_state_dict(state); teacher.eval()
 
@@ -140,7 +143,7 @@ def distill(teacher_path, out_path, cfg, device, epochs=6, batches=200,
             win = sample_batch(ds, rng, batch, seq_len, cfg["window"])
             x = torch.from_numpy(win).to(device)
             with torch.no_grad():
-                td, tv, _ = teacher.forward_sequence(build_teacher_obs(x))
+                td, tv, _ = teacher.forward_sequence(build_teacher_obs(x, teacher_sd))
                 t_mean = td.concentration1 / (td.concentration1 + td.concentration0)
             sd, sv, _ = student.forward_sequence(x)
             s_mean = sd.concentration1 / (sd.concentration1 + sd.concentration0)
@@ -167,21 +170,17 @@ def distill(teacher_path, out_path, cfg, device, epochs=6, batches=200,
     print(f"saved distilled student -> {out_path}")
 
 
-def build_teacher_obs(x):
-    """Student windows [B,T,160,F+5] already carry the full fine-frame obs
-    (fine rows + 5 state cols incl. frame flag=0). The v2 teacher expects
-    fine(160) + 4h(24) + 12h(8) rows — rebuild its coarse frames from the
-    same fine rows (past-only aggregation, masked state cols flagged =1)."""
-    B, T, W, F = x.shape  # W=160 fine rows, F = features+5 (last col = frame flag)
-    fm = x[..., :F]  # all cols incl. frame flag
-    # 4h frame: last 96 fine rows -> 24 groups of 4
-    c4 = fm[:, :, -96:, :].reshape(B, T, 24, 4, F).mean(dim=3)
-    # 12h frame: use last 96 -> 8 groups of 12
-    c12 = fm[:, :, -96:, :].reshape(B, T, 8, 12, F).mean(dim=3)
-    # state cols travel with the mean (position/pnl/dd/tf are constant
-    # within a step, so averaging is exact); force frame flag = 1 (coarse)
+def build_teacher_obs(x, teacher_state_dim):
+    """Student windows [B,T,160,F+5] carry the FULL feature set (which may
+    include new XGB signal columns the teacher never saw). The v2 teacher
+    expects its own obs width (legacy feature_count + 5): fine rows +
+    rebuilt coarse frames. We feed the teacher only the columns it knows."""
+    B, T, W, F = x.shape
+    fm = x[..., :teacher_state_dim]  # legacy market + state columns
+    c4 = fm[:, :, -96:, :].reshape(B, T, 24, 4, teacher_state_dim).mean(dim=3)
+    c12 = fm[:, :, -96:, :].reshape(B, T, 8, 12, teacher_state_dim).mean(dim=3)
     c4[..., -1] = 1.0; c12[..., -1] = 1.0
-    return torch.cat([x, c4, c12], dim=2)
+    return torch.cat([fm, c4, c12], dim=2)
 
 
 def main():

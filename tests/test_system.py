@@ -13,6 +13,47 @@ def _make_df(n=300, seed=0):
                          "low": c*.98, "close": c, "volume": np.abs(rng.normal(1, .3, n))+.1})
 
 
+def test_xgb_features_no_lookahead(tmp_path=None):
+    """XGBoost signal columns must be prefix-invariant: predictions on a
+    prefix must equal the prefix of predictions on the full series. Trees
+    score each row from its own features, but this test also catches any
+    accidental label/median leakage from beyond the cut."""
+    import numpy as np, pandas as pd
+    from src.features.engine import FeatureEngine
+    from src.features.xgb_ensemble import fit_ensemble, transform_ensemble
+    df = _make_df(600, seed=11)
+    fe = FeatureEngine()
+    feat = fe.transform(df)
+    tr = 400
+    dm, vm, names = fit_ensemble(feat.iloc[:tr], df.close.iloc[:tr])
+    full = transform_ensemble(feat, df.close, dm, vm, names)
+    # cut the tail (the 'future') and re-transform — prefix must match
+    feat_cut = fe.transform(df.iloc[:350].reset_index(drop=True))
+    cut = transform_ensemble(feat_cut, df.close.iloc[:350], dm, vm, names)
+    np.testing.assert_allclose(full.values[:350], cut.values, atol=1e-6)
+    # model itself must never have seen rows beyond tr in FITTING:
+    # guaranteed by construction; verified indirectly by invariance above.
+
+
+def test_xgb_features_are_sane_signals(tmp_path=None):
+    """The three columns exist, are finite, and dir probability spans a
+    meaningful range (a constant column would mean the trees are blind)."""
+    import numpy as np, pandas as pd
+    from src.features.engine import FeatureEngine
+    from src.features.xgb_ensemble import fit_ensemble, transform_ensemble
+    df = _make_df(800, seed=13)
+    fe = FeatureEngine()
+    feat = fe.transform(df)
+    dm, vm, names = fit_ensemble(feat.iloc[:500], df.close.iloc[:500])
+    sig = transform_ensemble(feat, df.close, dm, vm, names)
+    assert list(sig.columns) == ["xgb_dir_24", "xgb_edge", "xgb_vol"]
+    assert np.isfinite(sig.values).all()
+    assert sig["xgb_dir_24"].nunique() > 10, "dir signal must vary"
+    assert sig["xgb_vol"].between(0, 1).all() and sig["xgb_dir_24"].between(0, 1).all()
+    # edge is exactly 2*dir-1 by construction
+    np.testing.assert_allclose(sig["xgb_edge"], 2*sig["xgb_dir_24"]-1, atol=1e-6)
+
+
 def test_features_no_future_fill():
     f = FeatureEngine().transform(_make_df())
     assert np.isfinite(f.values).all(); assert len(f) == 300

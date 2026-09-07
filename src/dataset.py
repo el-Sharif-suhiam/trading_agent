@@ -78,13 +78,37 @@ def build(raw_dir, processed_dir, train_frac=.70, val_frac=.15, unseen_symbols=N
     if not files: raise RuntimeError("No raw CSV files found")
     unseen_symbols={x.replace("/","_").upper() for x in (unseen_symbols or [])}
     engine=FeatureEngine(); prepared=[]; unseen_prepared=[]; scaler=StandardScaler()
+    use_xgb = os.environ.get("USE_XGB_FEATURES", "1") == "1"
+    xgb_models = {}
     for f in files:
         raw=pd.read_csv(f,parse_dates=["datetime"])
         raw=raw.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
         if len(raw)<1000: print("Skipping short asset",f); continue
         feat=engine.transform(raw)
         n=len(raw); tr=int(n*train_frac); va=int(n*(train_frac+val_frac))
+        sym=os.path.basename(f).replace(".csv","").upper()
+        if use_xgb and sym not in unseen_symbols:
+            # fit ensemble on THIS asset's train segment only (rule #10),
+            # predict past-only rows -> 3 extra feature columns
+            from .features.xgb_ensemble import fit_ensemble, transform_ensemble
+            dm, vm, names = fit_ensemble(feat.iloc[:tr], raw.close.iloc[:tr])
+            sig = transform_ensemble(feat, raw.close, dm, vm, names)
+            feat = pd.concat([feat, sig], axis=1)
+            xgb_models[sym] = (dm, vm, names)
         if os.path.basename(f).replace(".csv","").upper() in unseen_symbols:
+            if use_xgb:
+                # unseen assets: borrow the ensemble trained on the FIRST
+                # training asset (shared market grammar; keeps unseen data
+                # strictly out of every fitting step)
+                if xgb_models:
+                    ref = next(iter(xgb_models.values()))
+                    sig = transform_ensemble(feat, raw.close, ref[0], ref[1], ref[2])
+                    feat = pd.concat([feat, sig], axis=1)
+                else:
+                    zero = pd.DataFrame(0.0, index=feat.index,
+                                        columns=["xgb_dir_24","xgb_edge","xgb_vol"],
+                                        dtype=np.float32)
+                    feat = pd.concat([feat, zero], axis=1)
             unseen_prepared.append((f,raw,feat,tr,va))
         else:
             scaler.partial_fit(feat.iloc[:tr].values); prepared.append((f,raw,feat,tr,va))
