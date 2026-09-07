@@ -52,34 +52,69 @@ class SpotTradingEnv(gym.Env):
         self.ecstasy_cap=ecstasy_cap; self.timing_horizon=timing_horizon
         self.survival_bonus=survival_bonus
         self.peak_ambition_coef=peak_ambition_coef
-        # multi-frame window layout: fine(1h) + 4h + 12h rows
-        # `window` now means the FINE (1h) portion of the observation.
+        # multi-frame window layout: fine(1h) + 4h + 12h + 1d + weekly rows
+        # `window` means the FINE (1h) portion of the observation.
+        # Context ladder: 160h (~6.7d) + 4d(4h) + 4d(12h) + 30d(daily)
+        # + ~56d(weekly) — the agent sees ~3 months of structure in
+        # ~230 rows instead of bloating the fine window.
         self.window_fine = window
-        self.obs_rows = window + 24 + 8
+        self.n_daily = 30   # 30 daily rows = 30 days of context
+        self.n_weekly = 8   # 8 weekly rows  = ~8 weeks of context
+        self.obs_rows = window + 24 + 8 + self.n_daily + self.n_weekly
         n_state = 5  # position, pnl, drawdown, time fraction, frame flag
         self.observation_space=spaces.Box(-np.inf,np.inf,shape=(self.obs_rows,features.shape[1]+n_state),dtype=np.float32)
         self.action_space=spaces.Box(0.,1.,shape=(1,),dtype=np.float32)
+
+    def _coarse_frame(self, rows, group, cache_attr):
+        """Sliding coarse frame via cumulative sums — EXACTLY equivalent to
+        the legacy `features[i-g*rows+1:i+1].reshape(rows,g,-1).mean(1)`
+        layout (groups anchor at i and slide each step; the v2 model was
+        trained on this layout so bit-compatibility matters), computed in
+        O(rows*F) instead of O(rows*group*F) via a running cumsum."""
+        C = self._csum
+        lo0 = self._csum_lo  # absolute index of _csum[0]
+        i = self.i
+        # group k (0=oldest..rows-1=last): consecutive non-overlapping groups,
+        # the last one ending exactly at i. chunk k spans
+        # [i-g*(rows-k)+1 .. i-g*(rows-k-1)]  (inclusive ends).
+        ends = i - group * (rows - 1 - np.arange(rows))      # inclusive
+        hi = C[ends - lo0]
+        lo = np.empty_like(hi)
+        lo[1:] = C[ends[:-1] - lo0]          # start_k - 1 = end_{k-1}
+        lo[0] = C[ends[0] - group - lo0]     # start_0 - 1 (always >= lo0 by margin)
+        return ((hi - lo) / group).astype(np.float32)
 
     def _obs(self):
         # fine frame: last `window_fine` 1h candles (default 160 = ~6.7 days)
         wf = getattr(self, 'window_fine', 160)
         market = self.features[self.i - wf + 1:self.i + 1]
-        # coarse frames: 24 rows of 4h and 8 rows of 12h, built from the SAME
-        # 1h history (past-only aggregation — no look-ahead). Each coarse row
-        # is the mean of its underlying fine features (scale-free already).
-        f4 = self.features[self.i - 4 * 24 + 1:self.i + 1].reshape(24, 4, -1).mean(axis=1)
-        f12 = self.features[self.i - 12 * 8 + 1:self.i + 1].reshape(8, 12, -1).mean(axis=1)
+        # coarse frames: past-only aggregation (no look-ahead), incrementally
+        # cached per group boundary — each coarse row is the mean of its
+        # underlying fine features (scale-free already).
+        f4 = self._coarse_frame(24, 4, "f4")
+        f12 = self._coarse_frame(8, 12, "f12")
+        fd = self._coarse_frame(self.n_daily, 24, "fd")
+        fw = self._coarse_frame(self.n_weekly, 168, "fw")
         v = self._value(); pos = self.asset * self.close[self.i] / max(v, 1e-12)
         pnl = (v / self.initial_cash - 1.0)
         dd = v / max(self.peak, 1e-12) - 1.0
         tf = self.steps / max(self.episode_steps, 1)
-        state_fine = np.full((wf, 5), [pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1, 0.0], dtype=np.float32)
-        state_c4 = np.full((24, 5), [pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1, 1.0], dtype=np.float32)
-        state_c12 = np.full((8, 5), [pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1, 1.0], dtype=np.float32)
+        # portfolio state row — built once, tiled to all frames (one array
+        # op instead of five np.full calls per frame per step)
+        srow = np.array([pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1], dtype=np.float32)
+        row_fine = np.concatenate([srow, np.zeros(1, dtype=np.float32)])
+        row_coarse = np.concatenate([srow, np.ones(1, dtype=np.float32)])
+        state_fine = np.broadcast_to(row_fine, (wf, 5))
+        state_c4 = np.broadcast_to(row_coarse, (24, 5))
+        state_c12 = np.broadcast_to(row_coarse, (8, 5))
+        state_fd = np.broadcast_to(row_coarse, (self.n_daily, 5))
+        state_fw = np.broadcast_to(row_coarse, (self.n_weekly, 5))
         return np.concatenate([
             np.concatenate([market, state_fine], axis=1),
             np.concatenate([f4, state_c4], axis=1),
             np.concatenate([f12, state_c12], axis=1),
+            np.concatenate([fd, state_fd], axis=1),
+            np.concatenate([fw, state_fw], axis=1),
         ], axis=0)
 
     @staticmethod
@@ -97,15 +132,35 @@ class SpotTradingEnv(gym.Env):
 
     def reset(self,seed=None,options=None):
         super().reset(seed=seed)
-        # the fine window needs 160 candles behind; the 12h coarse frame
-        # needs 96 — both satisfied by requiring window_fine history.
-        need = max(self.window_fine, 96)
+        # the weekly frame needs 168*8=1344 candles of history; fine 160,
+        # 12h 96, daily 720 — the weekly margin dominates.
+        need = max(self.window_fine, 96, 168 * self.n_weekly)
         max_start=self.end-self.episode_steps-1
         if options and "start" in options: self.i=int(options["start"])
         else: self.i=int(self.np_random.integers(self.start+need-1,max_start+1)) if max_start>self.start+need-1 else self.start+need-1
         self.cash=self.initial_cash; self.asset=0.; self.steps=0; self.trades=0
         self.fees=0.; self.slippage_paid=0.
         self.peak=self.initial_cash; self.max_drawdown=0.
+        self._coarse_cache = {}
+        # running cumulative sum of features: _csum[k - base] = sum(features[0..k])
+        # for k in [base, end]. base = reset index — only the span this
+        # episode can ever touch is materialized (full-asset arrays x 32 envs
+        # were the RAM leak that degraded every cycle after the first).
+        # _csum_prev holds sum(features[0..base-1]) for subtractions below base.
+        self._csum_base = self.i
+        # margin needed below base: the deepest reach of any coarse frame
+        # (weekly: 168*8 rows) plus one for the subtraction row
+        margin = 168 * 8 + 1
+        lo_base = max(0, self._csum_base - margin)
+        span = max(1, self.end - lo_base)
+        self._csum = np.empty((span, self.features.shape[1]), dtype=np.float64)
+        # rows BELOW base are needed only as subtraction prefixes — one row
+        # per hour of margin is wasteful, but margin (1345) is tiny vs
+        # episode length and keeps absolute indexing exact.
+        self._csum_lo = lo_base  # absolute index of _csum[0]
+        np.cumsum(self.features[lo_base:self.i + 1].astype(np.float64),
+                  axis=0, out=self._csum[:self.i + 1 - lo_base])
+        self._csum_valid = self.i
         # doctrine trackers
         self.hwm=None; self.trough=None
         self.gross_gain=0.0; self.gross_loss=0.0
@@ -227,6 +282,14 @@ class SpotTradingEnv(gym.Env):
             self._register_entry(price)
         old=value; self._prev_close=float(self.close[self.i])
         self.i=min(self.i+1, self.end-1); self.steps+=1; new=self._value()
+        # extend the running cumsum for the (possibly clamped) new index
+        if self._csum_valid < self.i:
+            s = self._csum_valid + 1 - self._csum_lo
+            e = self.i + 1 - self._csum_lo
+            block = self.features[self._csum_valid + 1:self.i + 1].astype(np.float64)
+            np.cumsum(block, axis=0, out=self._csum[s:e])
+            self._csum[s:e] += self._csum[s - 1] if s > 0 else 0.0
+            self._csum_valid = self.i
         prev_peak=self.peak
         self.peak=max(self.peak,new); self.max_drawdown=min(self.max_drawdown,new/self.peak-1)
         # ---------- reward = THE GENIUS DOCTRINE ----------

@@ -15,6 +15,12 @@ class Trainer:
         self.cfg = cfg
         random.seed(cfg["seed"]); np.random.seed(cfg["seed"]); torch.manual_seed(cfg["seed"])
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # TF32: free 20-40% speedup on Ampere+ GPUs, no meaningful precision
+        # loss for RL training (mixed-scale rewards are robust to tf32)
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
         os.makedirs(cfg["model_dir"], exist_ok=True)
         os.makedirs(cfg["log_dir"], exist_ok=True)
 
@@ -78,12 +84,15 @@ class Trainer:
         N = len(envs); T = cfg["rollout_steps"]
         obs_np = SpotTradingEnv.batch_obs(envs)
         obs_t = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
-        O = torch.empty(N, T, *obs_t.shape[1:], device=self.device)
-        A = torch.empty(N, T, device=self.device)
-        LP = torch.empty(N, T, device=self.device)
-        R = torch.empty(N, T, device=self.device)
-        V = torch.empty(N, T, device=self.device)
-        D = torch.empty(N, T, device=self.device)
+        # rollout buffers live on CPU (pin for fast H2D) — GPU holds only the
+        # streaming obs + activations. The 8GB card cannot host the full
+        # N×T×230×F buffer plus PPO backward passes at once.
+        O = torch.empty(N, T, *obs_t.shape[1:], device="cpu", pin_memory=True)
+        A = torch.empty(N, T, device="cpu", pin_memory=True)
+        LP = torch.empty(N, T, device="cpu", pin_memory=True)
+        R = torch.empty(N, T, device="cpu", pin_memory=True)
+        V = torch.empty(N, T, device="cpu", pin_memory=True)
+        D = torch.empty(N, T, device="cpu", pin_memory=True)
         h = None
         for t in range(T):
             with torch.no_grad():
@@ -91,16 +100,18 @@ class Trainer:
                 act = dist.sample().clamp(1e-5, 1 - 1e-5)
                 lp = dist.log_prob(act)
             acts_np = act.cpu().numpy()
+            # obs for the NEXT step comes from the env returns directly —
+            # no second batch_obs pass (halves obs-building work per step)
             next_obs, rs, dones = [], [], []
             for j, e in enumerate(envs):
                 no, r, term, trunc, _ = e.step(np.array([acts_np[j]], dtype=np.float32))
                 next_obs.append(no); rs.append(r); dones.append(term or trunc)
-            obs_np = SpotTradingEnv.batch_obs(envs)
-            O[:, t] = obs_t; A[:, t] = act; LP[:, t] = lp
-            R[:, t] = torch.tensor(rs, device=self.device)
-            V[:, t] = val
-            D[:, t] = torch.tensor(dones, dtype=torch.float32, device=self.device)
-            obs_t = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
+            O[:, t] = obs_t.cpu(); A[:, t] = act.cpu(); LP[:, t] = lp.cpu()
+            R[:, t] = torch.tensor(rs)
+            V[:, t] = val.cpu()
+            D[:, t] = torch.tensor(dones, dtype=torch.float32)
+            obs_np = np.stack(next_obs)  # envs always share shape/dtype
+            obs_t = torch.from_numpy(np.ascontiguousarray(obs_np)).to(self.device, non_blocking=True)
         with torch.no_grad():
             _, last_v, _ = self.model(obs_t[:, None], h)
         return O, A, LP, R, V, D, last_v
@@ -202,6 +213,12 @@ class Trainer:
                 print(f"stop requested via {stop_file}; saving and exiting cleanly")
                 break
             t0 = time.time()
+            # free previous cycle's buffers BEFORE building new ones —
+            # pinned rollout tensors (1.5GB) held through rebind caused
+            # double-buffer RAM spikes and slower cycles
+            O = A = LP = R = V = D = None
+            envs = None
+            import gc as _gc; _gc.collect()
             envs = self._make_envs()
             O, A, LP, R, V, D, last_v = self._rollout(envs)
             stats = self.ppo.update(O, A, LP, R, V, D, last_v)

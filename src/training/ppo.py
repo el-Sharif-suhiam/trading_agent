@@ -19,11 +19,15 @@ class PPO:
         for g in self.opt.param_groups: g["lr"] = lr
 
     def update(self, obs, actions, old_logprobs, rewards, values, dones, last_value):
-        """All inputs are env-major: obs [N,T,W,F], scalars [N,T].
-        Minibatches are slices of envs; the GRU runs along T inside each slice,
-        which matches the time axis used during rollout collection."""
+        """Inputs are env-major [N,T,...] and may live on CPU (rollout
+        buffers are kept there — the 8GB card cannot host the full
+        N×T×230×F obs plus PPO backward activations). Only ONE minibatch is
+        moved to GPU at a time. The GRU runs along T inside each slice,
+        matching the time axis used during rollout collection."""
         N, T = actions.shape
-        device = obs.device
+        device = next(self.model.parameters()).device
+        actions = actions.to(device); old_logprobs = old_logprobs.to(device)
+        rewards = rewards.to(device); values = values.to(device); dones = dones.to(device)
         # GAE over the time axis, per env
         last_value = last_value.to(device).reshape(-1)
         adv = torch.zeros_like(rewards)
@@ -41,16 +45,22 @@ class PPO:
         stats = {}
         approx_kl = 0.0
         stop_early = False
+        n_updates = 0
+        kl_vals = []  # running KL across the epoch — stop only when the
+        # AVERAGE drifts past the guard (per-minibatch KL spikes once
+        # recompute noise; an epoch-average is the honest trust region)
         for _ in range(self.epochs):
             if stop_early: break
-            order = torch.randperm(N, device=device)
+            order = torch.randperm(N)  # on CPU alongside the obs buffer
             for st in range(0, N, self.minibatch_size):
                 idx = order[st:st+self.minibatch_size]
                 if idx.numel() == 0: continue
-                dist, val, _ = self.model.forward_sequence(obs[idx])
+                # pull just this minibatch's obs from CPU — never the whole buffer
+                dist, val, _ = self.model.forward_sequence(obs[idx].to(device, non_blocking=True))
                 lp = dist.log_prob(actions[idx].clamp(1e-6, 1.-1e-6))
                 with torch.no_grad():
-                    approx_kl = (old_logprobs[idx] - lp).mean().item()
+                    kl_vals.append((old_logprobs[idx] - lp).mean().item())
+                    approx_kl = sum(kl_vals) / len(kl_vals)
                 if approx_kl > self.max_kl:
                     stop_early = True
                     break
@@ -69,4 +79,10 @@ class PPO:
                          "entropy": round(ent.item(), 5),
                          "ratio_clip_frac": round((torch.abs(ratio-1) > self.clip).float().mean().item(), 4),
                          "approx_kl": round(approx_kl, 5)}
+                n_updates += 1
+        if n_updates == 0:
+            # KL guard fired on the very first minibatch: report the guard
+            # value so the trainer's progress line stays meaningful
+            stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+                     "ratio_clip_frac": 0.0, "approx_kl": round(approx_kl, 5)}
         return stats

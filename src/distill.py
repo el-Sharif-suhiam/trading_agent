@@ -1,11 +1,17 @@
-"""Distillation: the old (v1) genius teaches the new (v2) brain.
+"""Distillation: the current (v2) genius teaches the new (v3) brain.
 
-Why: sacred rule #12 — never retrain from scratch. The v1 model holds
-27,389 updates of market understanding; distillation transfers it by
-matching the new model's action distributions and value estimates to the
-teacher's on thousands of real windows, BEFORE the new model starts its
-own PPO training. Nothing is lost; the successor starts as a young genius
-with an elder's memory.
+Why: sacred rule #12 — never retrain from scratch. The v2 model holds
+thousands of updates of market understanding; distillation transfers it
+by matching the new model's action distributions and value estimates to
+the teacher's on thousands of real windows, BEFORE the new model starts
+its own PPO training. Nothing is lost; the successor starts as a young
+genius with an elder's memory.
+
+v3 upgrades over v2 (reviewer + context ladder):
+  - Reviewer unit (second thought): GRU 256 + self-attention, zero-init
+    residual — silent at birth, earns influence only if it helps.
+  - Daily (30 rows) + weekly (8 rows) context frames — ~3 months of
+    structure in 38 extra rows.
 
 Usage:
     python -m src.distill --teacher models/stable.pt --student-out models/distilled.pt
@@ -19,61 +25,12 @@ from .dataset import AssetDataset
 from .model import TradingAgent
 
 
-def old_agent(feature_count, cfg):
-    """Rebuild the v1 architecture (window-GRU encoder, 2-layer decision GRU,
-    128 cells) to load the teacher checkpoint. Kept compact — distillation
-    only. The v1's real definition lives in git history (commit e26c993)."""
-    import torch.nn as nn
-
-    class V1(nn.Module):
-        def __init__(self, input_size, encoder_size=128, hidden_size=128, num_gru_layers=2):
-            super().__init__()
-            self.window_gru = nn.GRU(input_size, encoder_size, batch_first=True)
-            self.gru = nn.GRU(encoder_size, hidden_size, num_layers=num_gru_layers, batch_first=True)
-            self.policy = nn.Sequential(nn.Linear(hidden_size, 64), nn.Tanh())
-            self.alpha = nn.Linear(64, 1)
-            self.beta = nn.Linear(64, 1)
-            self.value = nn.Sequential(nn.Linear(hidden_size, 64), nn.Tanh(), nn.Linear(64, 1))
-            self.num_layers = num_gru_layers
-
-        def forward(self, x, h=None):
-            b, t, w, f = x.shape
-            flat = x.reshape(b * t, w, f)
-            e, _ = self.window_gru(flat)
-            z = e[:, -1].reshape(b, t, -1)
-            y, h = self.gru(z, h)
-            q = self.policy(y[:, -1])
-            alpha = torch.nn.functional.softplus(self.alpha(q)) + 0.05
-            beta = torch.nn.functional.softplus(self.beta(q)) + 0.05
-            value = self.value(y[:, -1]).squeeze(-1)
-            return Beta(alpha.squeeze(-1), beta.squeeze(-1)), value, h
-
-        def forward_sequence(self, x, h=None):
-            b, t, w, f = x.shape
-            flat = x.reshape(b * t, w, f)
-            e, _ = self.window_gru(flat)
-            z = e[:, -1].reshape(b, t, -1)
-            y, h = self.gru(z, h)
-            q = self.policy(y)
-            alpha = torch.nn.functional.softplus(self.alpha(q)) + 0.05
-            beta = torch.nn.functional.softplus(self.beta(q)) + 0.05
-            value = self.value(y).squeeze(-1)
-            return Beta(alpha.squeeze(-1), beta.squeeze(-1)), value, h
-
-    return V1(feature_count + 4,
-              tcfg_enc(cfg), tcfg_hid(cfg), tcfg_layers(cfg))
-
-
-def tcfg_enc(cfg): return cfg.get("encoder_size", 128)
-def tcfg_hid(cfg): return cfg.get("hidden_size", 128)
-def tcfg_layers(cfg): return cfg.get("num_gru_layers", 2)
-
-
 def sample_batch(ds, rng, batch, seq_len, window):
     """Sample [B, T, W, F] observation tensors from real training windows.
-    v1 windows were fine-only 96 rows + 4 state cols."""
+    v2 windows were fine-only (default 160) rows + 5 state cols; coarse
+    frames are rebuilt from the same fine rows by the obs builder."""
     B, T, W = batch, seq_len, window
-    Fdim = ds.feature_count + 4
+    Fdim = ds.feature_count + 5
     out = np.empty((B, T, W, Fdim), dtype=np.float32)
     starts = []
     for b in range(B):
@@ -85,26 +42,93 @@ def sample_batch(ds, rng, batch, seq_len, window):
             if i + 1 >= a["end"]:
                 i = a["end"] - 2
             feat = a["features"][i - W + 1:i + 1]
-            # v1's 4 portfolio-state columns were generated live by the env;
-            # for distillation we use neutral state (flat, no position) —
-            # the action distribution transfer is about market reading.
-            state = np.zeros((W, 4), dtype=np.float32)
+            # portfolio-state columns: neutral (flat, no position) — the
+            # action-distribution transfer is about market reading.
+            state = np.zeros((W, 5), dtype=np.float32)
             state[:, 2] = 0.0; state[:, 3] = t / T * 2 - 1
             out[b, t] = np.concatenate([feat, state], axis=1)
     return out
 
 
-def distill(teacher_path, out_path, cfg, device, epochs=3, batches=200,
-            batch=16, seq_len=32, lr=1e-4):
+def v2_agent(feature_count, cfg):
+    """Rebuild the v2 architecture (no reviewer, 3-frame obs) to load the
+    teacher checkpoint. v3's real definition is the current agent.py."""
+    import torch.nn as nn
+    from .model.agent import TimeframeGating
+
+    class V2(nn.Module):
+        def __init__(self, input_size, encoder_size=256, hidden_size=256, num_gru_layers=3):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(input_size, encoder_size), nn.LayerNorm(encoder_size), nn.Tanh(),
+                nn.Linear(encoder_size, encoder_size), nn.Tanh())
+            self.frame_gate = TimeframeGating(encoder_size)
+            self.attn_q = nn.Linear(encoder_size, 64)
+            self.attn_k = nn.Linear(encoder_size, 64)
+            self.gru = nn.GRU(encoder_size, hidden_size, num_layers=num_gru_layers, batch_first=True)
+            self.policy = nn.Sequential(nn.Linear(hidden_size, 64), nn.Tanh())
+            self.alpha = nn.Linear(64, 1)
+            self.beta = nn.Linear(64, 1)
+            self.value = nn.Sequential(nn.Linear(hidden_size, 64), nn.Tanh(), nn.Linear(64, 1))
+            self.num_layers = num_gru_layers
+            self.apply(self._init)
+
+        @staticmethod
+        def _init(m):
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight); nn.init.constant_(m.bias, 0)
+
+        def encode_windows(self, x):
+            b, t, w, f = x.shape
+            flat = x.reshape(b * t, w, f)
+            e = self.encoder(flat)
+            fine_mask = (flat[..., -1] < 0.5)
+            n_fine = fine_mask.sum(1, keepdim=True).clamp(min=1)
+            n_coarse = (w - fine_mask.sum(1, keepdim=True)).clamp(min=1)
+            fine = (e * fine_mask.unsqueeze(-1)).sum(1) / n_fine
+            coarse = (e * (~fine_mask).unsqueeze(-1)).sum(1) / n_coarse
+            mixed = self.frame_gate(fine, coarse)
+            q = self.attn_q(mixed); k = self.attn_k(coarse)
+            aff = torch.sigmoid((q * k).sum(-1))
+            attended = mixed + aff.unsqueeze(-1) * coarse
+            return attended.reshape(b, t, -1)
+
+        def forward(self, x, h=None):
+            z = self.encode_windows(x)
+            y, h = self.gru(z, h)
+            q = self.policy(y[:, -1])
+            alpha = torch.nn.functional.softplus(self.alpha(q)) + 0.05
+            beta = torch.nn.functional.softplus(self.beta(q)) + 0.05
+            value = self.value(y[:, -1]).squeeze(-1)
+            return torch.distributions.Beta(alpha.squeeze(-1), beta.squeeze(-1)), value, h
+
+        def forward_sequence(self, x, h=None):
+            z = self.encode_windows(x)
+            y, h = self.gru(z, h)
+            q = self.policy(y)
+            alpha = torch.nn.functional.softplus(self.alpha(q)) + 0.05
+            beta = torch.nn.functional.softplus(self.beta(q)) + 0.05
+            value = self.value(y).squeeze(-1)
+            return torch.distributions.Beta(alpha.squeeze(-1), beta.squeeze(-1)), value, h
+
+    return V2(feature_count + 5,
+              cfg.get("encoder_size", 256), cfg.get("hidden_size", 256),
+              cfg.get("num_gru_layers", 3))
+
+
+def distill(teacher_path, out_path, cfg, device, epochs=6, batches=200,
+            batch=32, seq_len=32, lr=3e-4):
     ds = AssetDataset(cfg["processed_dir"], "train", cfg["window"])
     ck = torch.load(teacher_path, map_location=device, weights_only=False)
-    # the teacher must be built with ITS OWN config (v1: 128 cells, 2 layers)
+    # the teacher must be built with ITS OWN config (v2: reviewer-less, 3 frames)
     tcfg = ck.get("config", cfg)
-    teacher = old_agent(ds.feature_count, tcfg).to(device)
-    teacher.load_state_dict(ck["model"]); teacher.eval()
+    teacher = v2_agent(ds.feature_count, tcfg).to(device)
+    state = {k.replace("_orig_mod.", "", 1): v for k, v in ck["model"].items()}
+    teacher.load_state_dict(state); teacher.eval()
 
     student = TradingAgent(ds.feature_count + 5, cfg["encoder_size"],
-                           cfg["hidden_size"], cfg["num_gru_layers"]).to(device)
+                           cfg["hidden_size"], cfg["num_gru_layers"],
+                           review_size=cfg.get("review_size", 256)).to(device)
     opt = torch.optim.Adam(student.parameters(), lr=lr)
     rng = np.random.default_rng(cfg.get("seed", 42))
 
@@ -113,19 +137,20 @@ def distill(teacher_path, out_path, cfg, device, epochs=3, batches=200,
     for ep in range(epochs):
         tot = 0.0
         for it in range(batches):
-            win = sample_batch(ds, rng, batch, seq_len, 96)  # teacher sees v1 windows
+            win = sample_batch(ds, rng, batch, seq_len, cfg["window"])
             x = torch.from_numpy(win).to(device)
             with torch.no_grad():
-                td, tv, _ = teacher.forward_sequence(x)
+                td, tv, _ = teacher.forward_sequence(build_teacher_obs(x))
                 t_mean = td.concentration1 / (td.concentration1 + td.concentration0)
-            xs = build_student_obs(x, device)
-            sd, sv, _ = student.forward_sequence(xs)
+            sd, sv, _ = student.forward_sequence(x)
             s_mean = sd.concentration1 / (sd.concentration1 + sd.concentration0)
-            # match means (action), match concentration scale softly, match values
+            # match means (action), match concentration scale softly, match values.
+            # value magnitudes dwarf action means (log-return scale), so the
+            # value loss is scaled to keep both terms in comparable regimes.
             act_loss = (s_mean - t_mean).pow(2).mean()
             conc_loss = ((sd.concentration1 + sd.concentration0) -
                          (td.concentration1 + td.concentration0).clamp(min=0.1)).abs().mean() * 0.1
-            val_loss = (sv - tv).pow(2).mean()
+            val_loss = (sv - tv).pow(2).mean() * 0.05
             loss = act_loss + conc_loss + val_loss
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -142,31 +167,21 @@ def distill(teacher_path, out_path, cfg, device, epochs=3, batches=200,
     print(f"saved distilled student -> {out_path}")
 
 
-def build_student_obs(x, device):
-    """Convert teacher windows [B,T,96,F+4] into student v2 windows
-    [B,T,192,F+5]: fine 160 rows aren't available from a 96-row window, so
-    we pad by repeating the earliest row (state-only padding — market rows
-    come from the same window). Frame flag appended: fine=0, coarse=1.
-    Coarse rows: 24 (4h) and 8 (12h) built by masked averaging of fine rows.
-    """
-    B, T, W, F = x.shape
-    out_fine = x.new_zeros(B, T, 160, F + 1)
-    out_fine[:, :, :W, :F] = x
-    if W < 160:
-        out_fine[:, :, W:, :F] = x[:, :, :1, :]  # pad with earliest row
-        out_fine[:, :, W:, F] = 0  # padded fine rows flag stays fine
-    out_fine[:, :, :, F] = 0.0
-    # coarse 4h: average consecutive groups of 4 fine rows (padded repeats)
-    fine = out_fine[:, :, :, :F]
-    c4 = fine.reshape(B, T, 40, 4, F).mean(dim=3)  # 40 groups from 160 rows
-    c4 = c4[:, :, -24:]
-    c12 = fine.reshape(B, T, 16, 10, F).mean(dim=3)  # ~12h groups of 12: use 10-row groups
-    c12 = c12[:, :, -8:]
-    def flag(rows, val):
-        fl = torch.full((rows.shape[0], rows.shape[1], rows.shape[2], 1), val,
-                        device=rows.device, dtype=rows.dtype)
-        return torch.cat([rows, fl], dim=-1)
-    return torch.cat([out_fine, flag(c4, 1.0), flag(c12, 1.0)], dim=2)
+def build_teacher_obs(x):
+    """Student windows [B,T,160,F+5] already carry the full fine-frame obs
+    (fine rows + 5 state cols incl. frame flag=0). The v2 teacher expects
+    fine(160) + 4h(24) + 12h(8) rows — rebuild its coarse frames from the
+    same fine rows (past-only aggregation, masked state cols flagged =1)."""
+    B, T, W, F = x.shape  # W=160 fine rows, F = features+5 (last col = frame flag)
+    fm = x[..., :F]  # all cols incl. frame flag
+    # 4h frame: last 96 fine rows -> 24 groups of 4
+    c4 = fm[:, :, -96:, :].reshape(B, T, 24, 4, F).mean(dim=3)
+    # 12h frame: use last 96 -> 8 groups of 12
+    c12 = fm[:, :, -96:, :].reshape(B, T, 8, 12, F).mean(dim=3)
+    # state cols travel with the mean (position/pnl/dd/tf are constant
+    # within a step, so averaging is exact); force frame flag = 1 (coarse)
+    c4[..., -1] = 1.0; c12[..., -1] = 1.0
+    return torch.cat([x, c4, c12], dim=2)
 
 
 def main():
@@ -174,9 +189,9 @@ def main():
     p.add_argument("--teacher", default="models/stable.pt")
     p.add_argument("--student-out", default="models/distilled.pt")
     p.add_argument("--config", default="config/default.json")
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--batches", type=int, default=200)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--batch", type=int, default=32)
     p.add_argument("--seq-len", type=int, default=32)
     a = p.parse_args()
     cfg = json.load(open(a.config))

@@ -20,16 +20,16 @@ class AssetDataset:
 
     def sample(self, rng, steps, window=0, crisis_bias=0.0):
         """Random episode start; `window` here is the FINE-window history
-        requirement (160 for the v2 multi-frame observation). The coarse
-        12h rows need only 96 candles — covered by the same margin."""
+        requirement (160 for the v2 multi-frame observation). The weekly
+        frame needs 1344 candles — the largest margin of all frames."""
         for _ in range(100):
             a = self.assets[int(rng.integers(len(self.assets)))]
-            lo = a["start"] + max(window, 96) - 1
+            lo = a["start"] + max(window, 1344)
             hi = a["end"] - steps - 1
             if hi < lo:
                 continue
             if crisis_bias > 0 and rng.random() < crisis_bias:
-                s = self._crisis_start(rng, a, steps, max(window, 96))
+                s = self._crisis_start(rng, a, steps, max(window, 1344))
                 if s is not None:
                     return a, s
             return a, int(rng.integers(lo, hi + 1))

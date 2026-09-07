@@ -59,7 +59,13 @@ def run_batch(model, assets, cfg, device, batch_size=16):
             if hs is not None and len(still) < len(active):
                 idx = torch.tensor(still, device=device)
                 if isinstance(hs, tuple):
-                    hs = tuple(h[:, idx] for h in hs)
+                    stacked, r_cache = hs
+                    # stacked GRU hidden: [layers, B, R] -> index dim 1
+                    stacked = stacked[:, idx]
+                    # reviewer r-cache: [B, past, R] -> index dim 0
+                    if r_cache is not None:
+                        r_cache = r_cache[idx]
+                    hs = (stacked, r_cache)
                 else:
                     hs = hs[:, idx]
         active = [active[k] for k in still]

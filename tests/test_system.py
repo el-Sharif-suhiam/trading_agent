@@ -27,18 +27,88 @@ def test_features_prefix_invariance():
 
 
 def test_env_portfolio_state_in_obs():
-    f = np.random.randn(1000, 80).astype(np.float32)
-    c = np.linspace(100, 150, 1000)
-    e = SpotTradingEnv(f, c, 0, 1000, 16, 100)
-    o, _ = e.reset(options={"start": 200})
-    assert o.shape == (16 + 24 + 8, 80 + 5)  # fine+4h+12h rows, +5 state cols
+    f = np.random.randn(2000, 80).astype(np.float32)
+    c = np.linspace(100, 150, 2000)
+    e = SpotTradingEnv(f, c, 0, 2000, 16, 100)
+    o, _ = e.reset(options={"start": 1400})
+    assert o.shape == (16 + 24 + 8 + 30 + 8, 80 + 5)  # fine+4h+12h+daily+weekly rows, +5 state cols
+
+
+def test_env_daily_weekly_frames_past_only():
+    """Coarse daily/weekly rows must be pure past-only aggregation of the
+    fine features: a change in FUTURE candles must not alter them."""
+    f = np.random.randn(2000, 12).astype(np.float32)
+    c = np.linspace(100, 150, 2000)
+    e1 = SpotTradingEnv(f, c, 0, 2000, 16, 100)
+    o1, _ = e1.reset(options={"start": 1400})
+    e2 = SpotTradingEnv(f[:1401], c[:1401], 0, 1401, 16, 100)  # truncate future
+    o2, _ = e2.reset(options={"start": 1400})
+    # everything the agent sees at t=1400 must be identical without the future
+    np.testing.assert_allclose(o1, o2, atol=1e-6)
+
+
+def test_env_daily_weekly_rows_match_manual_aggregation():
+    f = np.arange(2000 * 3, dtype=np.float32).reshape(2000, 3)
+    c = np.linspace(100, 150, 2000)
+    e = SpotTradingEnv(f, c, 0, 2000, 16, 100)
+    o, _ = e.reset(options={"start": 1500})
+    i = 1500
+    manual_daily = f[i - 24*30 + 1:i + 1].reshape(30, 24, 3).mean(axis=1)
+    manual_weekly = f[i - 168*8 + 1:i + 1].reshape(8, 168, 3).mean(axis=1)
+    daily = o[16+24+8:16+24+8+30, :3]
+    weekly = o[16+24+8+30:, :3]
+    np.testing.assert_allclose(daily, manual_daily, atol=1e-5)
+    np.testing.assert_allclose(weekly, manual_weekly, atol=1e-5)
+
+
+def test_reviewer_zero_init_model_equals_predecessor():
+    """The safety contract: with zero-init projection, the reviewer is
+    SILENT — new model outputs must equal a reviewer-less model's."""
+    import torch.nn as nn
+    torch.manual_seed(3)
+    m = TradingAgent(20, encoder_size=32, hidden_size=32, num_gru_layers=2, review_size=32)
+    m.eval()
+    assert bool((m.reviewer.proj.weight == 0).all()), "proj must start zeroed"
+    x = torch.randn(2, 4, 10, 20)
+    with torch.no_grad():
+        d, v, _ = m.forward_sequence(x)
+    # same model with reviewer output forcibly ignored must produce identical results
+    with torch.no_grad():
+        z = m.encode_windows(x)
+        y, _ = m.gru(z)
+        q = m.policy(y)
+        alpha = torch.nn.functional.softplus(m.alpha(q)) + 0.05
+        beta = torch.nn.functional.softplus(m.beta(q)) + 0.05
+    mean_with = d.concentration1 / (d.concentration1 + d.concentration0)
+    mean_without = alpha / (alpha + beta)
+    torch.testing.assert_close(mean_with, mean_without.squeeze(-1), rtol=1e-5, atol=1e-6)
+
+
+def test_reviewer_hidden_pair_roundtrip():
+    """Hidden state is a stacked pair [main | reviewer]; forward and
+    forward_sequence must stay consistent through it (axis invariant)."""
+    torch.manual_seed(4)
+    m = TradingAgent(6, encoder_size=16, hidden_size=16, num_gru_layers=2, review_size=16)
+    m.eval()
+    x = torch.randn(2, 5, 4, 6)
+    with torch.no_grad():
+        ds, vs, _ = m.forward_sequence(x)
+        h = None; means, vals = [], []
+        for t in range(5):
+            d, v, h = m(x[:, t:t+1], h)
+            means.append((d.concentration1/(d.concentration1+d.concentration0)).squeeze(-1))
+            vals.append(v)
+        means = torch.stack(means, dim=1); vals = torch.stack(vals, dim=1)
+        sm = ds.concentration1/(ds.concentration1+ds.concentration0)
+    torch.testing.assert_close(means, sm, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(vals, vs, rtol=1e-4, atol=1e-5)
 
 
 def test_env_deadband_blocks_fee_churn():
-    f = np.random.randn(1000, 80).astype(np.float32)
-    c = np.linspace(100, 150, 1000)
-    e = SpotTradingEnv(f, c, 0, 1000, 96, 100, min_trade_fraction=.02)
-    e.reset(options={"start": 95})
+    f = np.random.randn(2000, 80).astype(np.float32)
+    c = np.linspace(100, 150, 2000)
+    e = SpotTradingEnv(f, c, 0, 2000, 96, 100, min_trade_fraction=.02)
+    e.reset(options={"start": 1400})
     _, _, _, _, i1 = e.step(np.array([.5], np.float32))   # opens position
     _, _, _, _, i2 = e.step(np.array([.501], np.float32)) # tiny wiggle: must NOT trade
     _, _, _, _, i3 = e.step(np.array([.9], np.float32))   # big change: trades
@@ -46,13 +116,13 @@ def test_env_deadband_blocks_fee_churn():
 
 
 def test_env_freezes_at_end():
-    f = np.random.randn(200, 8).astype(np.float32)
-    c = np.linspace(100, 150, 200)
-    e = SpotTradingEnv(f, c, 0, 200, 96, 1000)  # episode_steps > remaining data
-    e.reset(options={"start": 95})
-    for _ in range(150):
+    f = np.random.randn(1500, 8).astype(np.float32)
+    c = np.linspace(100, 150, 1500)
+    e = SpotTradingEnv(f, c, 0, 1500, 96, 1000)  # episode_steps > remaining data
+    e.reset(options={"start": 1495})
+    for _ in range(50):
         _, _, term, trunc, _ = e.step(np.array([.5], np.float32))
-    assert e.i == 199 and term  # clamped, never wrapped into negative slices
+    assert e.i == 1499 and term  # clamped, never wrapped into negative slices
 
 
 def test_agent_full_range():
@@ -60,7 +130,10 @@ def test_agent_full_range():
     x = torch.randn(4, 8, 48, 84)
     d, v, h = m.forward_sequence(x)
     a = d.sample()
-    assert a.shape == (4, 8) and v.shape == (4, 8) and h.shape == (3, 4, 256)
+    assert a.shape == (4, 8) and v.shape == (4, 8)
+    # hidden pair: 3 main GRU layers + 1 reviewer layer (+ reviewer r-cache)
+    stacked, r_cache = h
+    assert stacked.shape == (4, 4, 256) and r_cache.shape == (4, 8, 256)
     # Beta support is the full open interval (0,1): sampled actions near extremes are legal
     assert (a > 0).all() and (a < 1).all()
     # untrained net on random data should produce varied means, not a collapsed constant
@@ -89,15 +162,15 @@ def test_gru_time_axis_consistency():
 def test_ppo_update_runs_and_matches_rollout_axis():
     """End-to-end PPO update on env-major [N,T,...] tensors with a real env."""
     torch.manual_seed(0)
-    feats = np.random.randn(2000, 8).astype(np.float32)
-    c = np.linspace(100, 160, 2000)
-    envs = [SpotTradingEnv(feats, c, 0, 2000, 16, 32) for _ in range(3)]
-    for k, e in enumerate(envs): e.reset(seed=k, options={"start": 200+k})
-    m = TradingAgent(8+5, encoder_size=32, hidden_size=32, num_gru_layers=1)
+    feats = np.random.randn(3000, 8).astype(np.float32)
+    c = np.linspace(100, 160, 3000)
+    envs = [SpotTradingEnv(feats, c, 0, 3000, 16, 32) for _ in range(3)]
+    for k, e in enumerate(envs): e.reset(seed=k, options={"start": 1600+k})
+    m = TradingAgent(8+5, encoder_size=32, hidden_size=32, num_gru_layers=1, review_size=32)
     ppo = PPO(m, epochs=2, minibatch_size=2, max_kl=10.0)  # KL guard off for smoke test
     N, T = len(envs), 16
     obs = np.stack([e._obs() for e in envs])
-    O = torch.empty(N, T, 48, 13); A = torch.empty(N, T)
+    O = torch.empty(N, T, 86, 13); A = torch.empty(N, T)
     LP = torch.empty(N, T); R = torch.empty(N, T)
     V = torch.empty(N, T); D = torch.empty(N, T)
     h = None; obs_t = torch.tensor(obs)
@@ -127,7 +200,7 @@ def test_dataset_window_guard(tmp_path=None):
     import os, tempfile
     from src.dataset import AssetDataset
     d = tempfile.mkdtemp()
-    n = 400
+    n = 2500
     df = pd.DataFrame({"datetime": pd.date_range("2020-01-01", periods=n, freq="h", tz="UTC"),
                        "close": np.linspace(100, 150, n)})
     for col in ["f1", "f2"]: df[col] = np.random.randn(n).astype(np.float32)
@@ -137,7 +210,7 @@ def test_dataset_window_guard(tmp_path=None):
     ds = AssetDataset(d, "train", window=96)
     for _ in range(50):
         a, s = ds.sample(np.random.default_rng(), steps=100, window=96)
-        assert s >= 95 and s + 100 <= a["end"]  # full window behind, episode ahead
+        assert s >= 1343 and s + 100 <= a["end"]  # full weekly margin behind, episode ahead
 
 
 def test_stable_criterion_beats_lucky_peak():
@@ -156,13 +229,13 @@ def test_stable_criterion_beats_lucky_peak():
 
 def _doctrine_env(closes, **kw):
     """Env helper on a synthetic price path for doctrine tests.
-    v2 observation needs max(window_fine, 96) candles of history — we use
-    window=16 (fine) with a >=96-row lead-in inside the path itself."""
+    v3 observation needs max(window_fine, 96, 1344) candles of history —
+    we use window=16 (fine) with a >=1344-row lead-in inside the path itself."""
     import numpy as np
     f = np.zeros((len(closes), 8), dtype=np.float32)
     w = kw.pop("window", 16)
     e = SpotTradingEnv(f, np.asarray(closes, dtype=np.float64), 0, len(closes),
-                       window=w, episode_steps=max(1, len(closes) - 96), min_trade_fraction=0.0, **kw)
+                       window=w, episode_steps=max(1, len(closes) - 1344), min_trade_fraction=0.0, **kw)
     return e
 
 
@@ -182,18 +255,18 @@ def test_doctrine_punishes_big_loss_vs_gains():
     import numpy as np
     # entry at 100, rises to 110 (+10% = +1000 on 10k), then:
     # A: falls to 102 => L≈8%  (1000 gain / 800 loss)
-    pathA = [100.0]*130 + [110.0, 106.0, 102.0, 102.0]
+    pathA = [100.0]*1400 + [110.0, 106.0, 102.0, 102.0]
     # B: falls to 107 => L≈3%  (1000 gain / 300 loss)
-    pathB = [100.0]*130 + [110.0, 108.0, 107.0, 107.0]
-    iA = _run_env(_doctrine_env(pathA), start=129)
-    iB = _run_env(_doctrine_env(pathB), start=129)
+    pathB = [100.0]*1400 + [110.0, 108.0, 107.0, 107.0]
+    iA = _run_env(_doctrine_env(pathA), start=1399)
+    iB = _run_env(_doctrine_env(pathB), start=1399)
     assert iA["purity"] < iB["purity"], f"1000/800 (p={iA['purity']:.2f}) must be punished harder than 1000/300 (p={iB['purity']:.2f})"
 
 
 def test_doctrine_bleed_penalty_grows_with_drawdown():
     import numpy as np
-    e = _doctrine_env([100.0] * 140)
-    e.reset(options={"start": 130})
+    e = _doctrine_env([100.0] * 1410)
+    e.reset(options={"start": 1399})
     # simulate peak rising first (as if portfolio climbed), then test depths
     e.peak = 100.0; e.hwm = 100.0; e.trough = 100.0
     p0 = e._bleed_penalty(100.0)      # no drawdown -> 0
@@ -207,8 +280,8 @@ def test_doctrine_bleed_penalty_grows_with_drawdown():
 def test_doctrine_equal_gain_loss_scores_worst():
     """gain == loss must yield purity ~0, worse than any profitable ratio."""
     import numpy as np
-    e = _doctrine_env([100.0] * 130 + [110.0, 105.0, 100.0])  # +10% then full retrace
-    info = _run_env(e, start=129)
+    e = _doctrine_env([100.0] * 1400 + [110.0, 105.0, 100.0])  # +10% then full retrace
+    info = _run_env(e, start=1399)
     assert abs(info["purity"]) < 0.35, f"equal gain and loss must be ~purity 0, got {info['purity']}"
 
 
@@ -247,8 +320,8 @@ def test_regime_classifier():
 def test_inactivity_bias_punishes_pure_cash():
     """100% cash every step must accumulate negative shaping — the coward
     equilibrium (never trade) is mathematically dominated."""
-    e = _doctrine_env([100.0] * 140)
-    e.reset(options={"start": 130})
+    e = _doctrine_env([100.0] * 1410)
+    e.reset(options={"start": 1399})
     rewards = []
     while True:
         _, r, t, tr, _ = e.step(np.array([0.0], np.float32))
@@ -259,8 +332,8 @@ def test_inactivity_bias_punishes_pure_cash():
 
 def test_peak_ambition_rewards_new_highs_only():
     """Bonus fires on new highs, is capped, and doesn't repeat on flat."""
-    e = _doctrine_env([100.0] * 130 + [110.0, 110.0, 121.0, 121.0])
-    e.reset(options={"start": 129})
+    e = _doctrine_env([100.0] * 1400 + [110.0, 110.0, 121.0, 121.0])
+    e.reset(options={"start": 1399})
     while True:
         _, _, t, tr, _ = e.step(np.array([1.0], np.float32))
         if t or tr: break
@@ -273,9 +346,9 @@ def test_ecstasy_fades_with_mastery():
     progressive ambition — the same thrill demands bigger feats."""
     import numpy as np
     from src.training.environment import SpotTradingEnv
-    f = np.zeros((140, 8), np.float32)
-    e = SpotTradingEnv(f, np.full(140, 100.0), 0, 140, window=16, episode_steps=10)
-    e.reset(options={"start": 130})
+    f = np.zeros((1410, 8), np.float32)
+    e = SpotTradingEnv(f, np.full(1410, 100.0), 0, 1410, window=16, episode_steps=10)
+    e.reset(options={"start": 1399})
     e.ret_ema = 0.0
     first = e._ecstasy(0.05)
     e.ret_ema = 0.049   # mastered: now expects ~this return
@@ -288,11 +361,11 @@ def test_survival_bonus_for_fleeing_before_crash():
     import numpy as np
     from src.training.environment import SpotTradingEnv
     # flat, then a cliff at the end; agent stays in cash
-    path = [100.0]*130 + [94.0, 94.0, 94.0, 94.0, 94.0]
+    path = [100.0]*1400 + [94.0, 94.0, 94.0, 94.0, 94.0]
     f = np.zeros((len(path), 8), np.float32)
     e = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
-                       window=16, episode_steps=len(path)-135)
-    e.reset(options={"start": 130})
+                       window=16, episode_steps=8)
+    e.reset(options={"start": 1399})
     survived = 0.0
     while True:
         _, r, t, tr, info = e.step(np.array([0.0], np.float32))
@@ -311,11 +384,11 @@ def test_timing_bonus_for_surgical_entry():
     directly on a fresh env to keep the unit test pure."""
     import numpy as np
     from src.training.environment import SpotTradingEnv
-    path = [100.0]*130 + [98, 99, 100, 101, 102]
+    path = [100.0]*1400 + [98, 99, 100, 101, 102]
     f = np.zeros((len(path), 8), np.float32)
     e = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
-                       window=16, episode_steps=len(path)-135, timing_horizon=4)
-    e.reset(options={"start": 130})
+                       window=16, episode_steps=8, timing_horizon=4)
+    e.reset(options={"start": 1399})
     e._register_entry(100.0)                      # surgical entry at the dip
     e._pending[0]["step"] = e.steps - 10          # force it to be matured
     e.i = len(path)-1                             # price now 102
@@ -324,8 +397,8 @@ def test_timing_bonus_for_surgical_entry():
     assert bonus <= e.ecstasy_cap, "timing bonus must be capped"
     # a doomed entry (price below entry after horizon) earns nothing
     e2 = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
-                        window=16, episode_steps=len(path)-135, timing_horizon=4)
-    e2.reset(options={"start": 130})
+                        window=16, episode_steps=8, timing_horizon=4)
+    e2.reset(options={"start": 1399})
     e2._register_entry(105.0)                     # bought the top
     e2._pending[0]["step"] = e2.steps - 10
     e2.i = len(path)-1
@@ -359,9 +432,13 @@ def test_adaptive_learning_reacts_to_decline_and_recovery():
 
 if __name__ == "__main__":
     test_features_no_future_fill(); test_features_prefix_invariance()
-    test_env_portfolio_state_in_obs(); test_env_deadband_blocks_fee_churn()
+    test_env_portfolio_state_in_obs(); test_env_daily_weekly_frames_past_only()
+    test_env_daily_weekly_rows_match_manual_aggregation()
+    test_env_deadband_blocks_fee_churn()
     test_env_freezes_at_end(); test_agent_full_range()
-    test_gru_time_axis_consistency(); test_ppo_update_runs_and_matches_rollout_axis()
+    test_gru_time_axis_consistency(); test_reviewer_zero_init_model_equals_predecessor()
+    test_reviewer_hidden_pair_roundtrip()
+    test_ppo_update_runs_and_matches_rollout_axis()
     test_dataset_window_guard(); test_stable_criterion_beats_lucky_peak()
     test_doctrine_punishes_big_loss_vs_gains(); test_doctrine_bleed_penalty_grows_with_drawdown()
     test_doctrine_equal_gain_loss_scores_worst(); test_crisis_sampling_finds_crashes()
