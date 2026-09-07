@@ -1,0 +1,3 @@
+update,portfolio_mean,trades,reward_mean,entropy,value_loss,policy_loss,ratio_clip_frac,kl,sec_per_update,val_return_pct,stable_val_return_pct
+1,7897.91,15650,-0.286323,-0.0623,0.98377,-0.17885,0.042,0.00161,7.7,,
+2,7650.88,15641,-0.296115,-0.07048,5.91694,0.0884,0.001,-0.00051,7.3,12.029,

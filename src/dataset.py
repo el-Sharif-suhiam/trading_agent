@@ -18,18 +18,18 @@ class AssetDataset:
             self.assets.append({"symbol":r.symbol,"features":feats,"close":close,"start":int(r.start_idx),"end":int(r.end_idx)})
         self.feature_count=self.assets[0]["features"].shape[1]
 
-    def sample(self, rng, steps, window=0, crisis_bias=0.0, close=None):
-        """Random episode start; with probability crisis_bias, sample from the
-        worst historical drawdown windows (crash training) using the close
-        price series to locate them dynamically."""
+    def sample(self, rng, steps, window=0, crisis_bias=0.0):
+        """Random episode start; `window` here is the FINE-window history
+        requirement (160 for the v2 multi-frame observation). The coarse
+        12h rows need only 96 candles — covered by the same margin."""
         for _ in range(100):
             a = self.assets[int(rng.integers(len(self.assets)))]
-            lo = a["start"] + window - 1
+            lo = a["start"] + max(window, 96) - 1
             hi = a["end"] - steps - 1
             if hi < lo:
                 continue
             if crisis_bias > 0 and rng.random() < crisis_bias:
-                s = self._crisis_start(rng, a, steps, window)
+                s = self._crisis_start(rng, a, steps, max(window, 96))
                 if s is not None:
                     return a, s
             return a, int(rng.integers(lo, hi + 1))

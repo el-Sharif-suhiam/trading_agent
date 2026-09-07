@@ -20,14 +20,25 @@ class Trainer:
 
         self.train_ds = AssetDataset(cfg["processed_dir"], "train", cfg["window"])
         self.val_ds = AssetDataset(cfg["processed_dir"], "validation", cfg["window"])
-        in_size = self.train_ds.feature_count + 4
+        in_size = self.train_ds.feature_count + 5
         self.model = TradingAgent(in_size, cfg["encoder_size"], cfg["hidden_size"], cfg["num_gru_layers"]).to(self.device)
+        if cfg.get("torch_compile", False) and hasattr(torch, "compile"):
+            try:
+                self.model = torch.compile(self.model)  # 1.3-2x after warmup
+                print("torch.compile enabled (first updates slower — JIT warmup)")
+            except Exception as exc:
+                print(f"torch.compile unavailable ({exc}); running eager")
+        self.base_entropy = cfg["entropy_coef"]
+        self.base_lr = cfg["learning_rate"]
         self.ppo = PPO(self.model, cfg["learning_rate"], cfg["gamma"], cfg["gae_lambda"], cfg["clip_coef"],
                        cfg["entropy_coef"], cfg["value_coef"], cfg["max_grad_norm"], cfg["ppo_epochs"],
                        cfg["minibatch_size"], cfg.get("max_kl", 0.02))
         self.update_i = 0
         self.best_val = -np.inf
         self.stable_val = -np.inf  # best 10-eval rolling mean (consistency criterion)
+        # adaptive learning state: recovers from overfitting stagnation
+        # (wave 1 of the agreed anti-overfit plan)
+        self.adapt = {"lr_scale": 1.0, "ent_scale": 1.0, "cooldown": 0}
         if resume_path:
             self._load_checkpoint(resume_path)
 
@@ -65,7 +76,8 @@ class Trainer:
     def _rollout(self, envs):
         cfg = self.cfg
         N = len(envs); T = cfg["rollout_steps"]
-        obs_t = torch.tensor(np.stack([e._obs() for e in envs]), device=self.device)
+        obs_np = SpotTradingEnv.batch_obs(envs)
+        obs_t = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
         O = torch.empty(N, T, *obs_t.shape[1:], device=self.device)
         A = torch.empty(N, T, device=self.device)
         LP = torch.empty(N, T, device=self.device)
@@ -78,15 +90,17 @@ class Trainer:
                 dist, val, h = self.model(obs_t[:, None], h)
                 act = dist.sample().clamp(1e-5, 1 - 1e-5)
                 lp = dist.log_prob(act)
+            acts_np = act.cpu().numpy()
             next_obs, rs, dones = [], [], []
             for j, e in enumerate(envs):
-                no, r, term, trunc, _ = e.step(np.array([act[j].item()], dtype=np.float32))
+                no, r, term, trunc, _ = e.step(np.array([acts_np[j]], dtype=np.float32))
                 next_obs.append(no); rs.append(r); dones.append(term or trunc)
+            obs_np = SpotTradingEnv.batch_obs(envs)
             O[:, t] = obs_t; A[:, t] = act; LP[:, t] = lp
             R[:, t] = torch.tensor(rs, device=self.device)
             V[:, t] = val
             D[:, t] = torch.tensor(dones, dtype=torch.float32, device=self.device)
-            obs_t = torch.tensor(np.stack(next_obs), device=self.device)
+            obs_t = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
         with torch.no_grad():
             _, last_v, _ = self.model(obs_t[:, None], h)
         return O, A, LP, R, V, D, last_v
@@ -106,8 +120,9 @@ class Trainer:
         return {"model": self.model.state_dict(), "optimizer": self.ppo.opt.state_dict(),
                 "update": self.update_i, "best_val": self.best_val,
                 "stable_val": self.stable_val, "config": self.cfg,
+                "adapt": self.adapt,
                 "feature_count": self.train_ds.feature_count,
-                "state_dim": self.train_ds.feature_count + 4}
+                "state_dim": self.train_ds.feature_count + 5}
 
     def _save(self, name):
         torch.save(self._ckpt(), os.path.join(self.cfg["model_dir"], name))
@@ -124,7 +139,41 @@ class Trainer:
         self.ppo.opt.load_state_dict(ck["optimizer"])
         self.update_i = ck.get("update", 0)
         self.best_val = ck.get("best_val", -np.inf)
-        print(f"resumed from {path} at update {self.update_i}")
+        self.stable_val = ck.get("stable_val", -np.inf)
+        self.adapt = ck.get("adapt", self.adapt)
+        print(f"resumed from {path} at update {self.update_i} "
+              f"(best {self.best_val:.2f}%, stable {self.stable_val if self.stable_val > -np.inf else 0:.2f}%)")
+
+    # ---------- adaptive learning (anti-overfitting, wave 1) ----------
+    def _adapt_on_eval(self, val_hist):
+        """Wave 1 of the agreed plan: when the mean of the last 5 evals is
+        DECLINING vs the previous 5-eval window, the model is likely memorizing
+        instead of learning. Response (bounded, reversible):
+          - cut LR (halve, floor 1/16 of base)   -> smaller memorization steps
+          - boost entropy coefficient (x2, cap x4) -> stronger exploration push
+        When evals recover, scales gradually return to 1.0.
+        Never stops training (sacred rule: no early stop)."""
+        cfg = self.cfg
+        window = cfg.get("adapt_window", 5)
+        if len(val_hist) < 2 * window:
+            return
+        recent = float(np.mean(val_hist[-window:]))
+        prev = float(np.mean(val_hist[-2*window:-window]))
+        if self.adapt["cooldown"] > 0:
+            self.adapt["cooldown"] -= 1
+            return
+        if recent < prev - 0.5:  # meaningful decline (>=0.5pp)
+            self.adapt["lr_scale"] = max(self.adapt["lr_scale"] * 0.5, 1/16)
+            self.adapt["ent_scale"] = min(self.adapt["ent_scale"] * 2.0, 4.0)
+            self.adapt["cooldown"] = cfg.get("adapt_cooldown", 10)  # evals before next change
+            print(f"  [adapt] eval decline detected ({prev:.1f}→{recent:.1f}%): "
+                  f"lr_scale={self.adapt['lr_scale']:.3f} ent_scale={self.adapt['ent_scale']:.1f}", flush=True)
+        elif recent > prev + 0.5:  # recovering: gently relax toward normal
+            self.adapt["lr_scale"] = min(self.adapt["lr_scale"] * 2.0, 1.0)
+            self.adapt["ent_scale"] = max(self.adapt["ent_scale"] * 0.5, 1.0)
+            self.adapt["cooldown"] = cfg.get("adapt_cooldown", 10)
+        # entropy coefficient applied to PPO for subsequent updates
+        self.ppo.entropy_coef = self.base_entropy * self.adapt["ent_scale"]
 
     # ---------- main loop ----------
     def train(self, time_budget_hours=None):
@@ -148,8 +197,10 @@ class Trainer:
             O, A, LP, R, V, D, last_v = self._rollout(envs)
             stats = self.ppo.update(O, A, LP, R, V, D, last_v)
             self.update_i += 1
-            self.ppo.set_lr(self._lr(cfg["learning_rate"], cfg.get("lr_final_factor", .1),
-                                     self.update_i / cfg["updates"]))
+            # LR schedule combined with adaptive scale (wave 1 anti-overfit)
+            scheduled = self._lr(cfg["learning_rate"], cfg.get("lr_final_factor", .1),
+                                 self.update_i / cfg["updates"])
+            self.ppo.set_lr(scheduled * self.adapt["lr_scale"])
             vals = [e._value() for e in envs]
             trades = sum(e.trades for e in envs)
             row = [self.update_i, round(np.mean(vals), 2), trades, round(R.mean().item(), 6),
@@ -176,6 +227,8 @@ class Trainer:
                     if score > self.stable_val:
                         self.stable_val = score
                         self._save("stable.pt")
+                # adaptive learning: react to decline/recovery (wave 1)
+                self._adapt_on_eval(val_hist)
                 # NOTE: no early stop. The system NEVER decides it cannot
                 # improve — it saves its best state and keeps trying with
                 # everything it has (user's explicit requirement).

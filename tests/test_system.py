@@ -29,9 +29,9 @@ def test_features_prefix_invariance():
 def test_env_portfolio_state_in_obs():
     f = np.random.randn(1000, 80).astype(np.float32)
     c = np.linspace(100, 150, 1000)
-    e = SpotTradingEnv(f, c, 0, 1000, 96, 100)
-    o, _ = e.reset(options={"start": 95})
-    assert o.shape == (96, 84)  # 80 market + 4 portfolio state
+    e = SpotTradingEnv(f, c, 0, 1000, 16, 100)
+    o, _ = e.reset(options={"start": 200})
+    assert o.shape == (16 + 24 + 8, 80 + 5)  # fine+4h+12h rows, +5 state cols
 
 
 def test_env_deadband_blocks_fee_churn():
@@ -57,10 +57,10 @@ def test_env_freezes_at_end():
 
 def test_agent_full_range():
     m = TradingAgent(84)
-    x = torch.randn(4, 8, 96, 84)
+    x = torch.randn(4, 8, 48, 84)
     d, v, h = m.forward_sequence(x)
     a = d.sample()
-    assert a.shape == (4, 8) and v.shape == (4, 8) and h.shape == (2, 4, 128)
+    assert a.shape == (4, 8) and v.shape == (4, 8) and h.shape == (3, 4, 256)
     # Beta support is the full open interval (0,1): sampled actions near extremes are legal
     assert (a > 0).all() and (a < 1).all()
     # untrained net on random data should produce varied means, not a collapsed constant
@@ -91,13 +91,13 @@ def test_ppo_update_runs_and_matches_rollout_axis():
     torch.manual_seed(0)
     feats = np.random.randn(2000, 8).astype(np.float32)
     c = np.linspace(100, 160, 2000)
-    envs = [SpotTradingEnv(feats, c, 0, 2000, 96, 32) for _ in range(3)]
+    envs = [SpotTradingEnv(feats, c, 0, 2000, 16, 32) for _ in range(3)]
     for k, e in enumerate(envs): e.reset(seed=k, options={"start": 200+k})
-    m = TradingAgent(8+4, encoder_size=32, hidden_size=32, num_gru_layers=1)
+    m = TradingAgent(8+5, encoder_size=32, hidden_size=32, num_gru_layers=1)
     ppo = PPO(m, epochs=2, minibatch_size=2, max_kl=10.0)  # KL guard off for smoke test
     N, T = len(envs), 16
     obs = np.stack([e._obs() for e in envs])
-    O = torch.empty(N, T, 96, 12); A = torch.empty(N, T)
+    O = torch.empty(N, T, 48, 13); A = torch.empty(N, T)
     LP = torch.empty(N, T); R = torch.empty(N, T)
     V = torch.empty(N, T); D = torch.empty(N, T)
     h = None; obs_t = torch.tensor(obs)
@@ -154,15 +154,15 @@ def test_stable_criterion_beats_lucky_peak():
     assert float(np.mean(hist2)) > 10.5, "consistent performance must be recognized"
 
 
-def _doctrine_env(closes):
+def _doctrine_env(closes, **kw):
     """Env helper on a synthetic price path for doctrine tests.
-    All cash (position=0): portfolio value follows... nothing. To observe
-    mark-to-market waterfall we hold full position via action=1."""
+    v2 observation needs max(window_fine, 96) candles of history — we use
+    window=16 (fine) with a >=96-row lead-in inside the path itself."""
     import numpy as np
     f = np.zeros((len(closes), 8), dtype=np.float32)
-    w = 4
+    w = kw.pop("window", 16)
     e = SpotTradingEnv(f, np.asarray(closes, dtype=np.float64), 0, len(closes),
-                       window=w, episode_steps=len(closes)-w, min_trade_fraction=0.0)
+                       window=w, episode_steps=max(1, len(closes) - 96), min_trade_fraction=0.0, **kw)
     return e
 
 
@@ -182,18 +182,18 @@ def test_doctrine_punishes_big_loss_vs_gains():
     import numpy as np
     # entry at 100, rises to 110 (+10% = +1000 on 10k), then:
     # A: falls to 102 => L≈8%  (1000 gain / 800 loss)
-    pathA = [100, 100, 100, 100, 110, 106, 102, 102, 102, 102]
+    pathA = [100.0]*130 + [110.0, 106.0, 102.0, 102.0]
     # B: falls to 107 => L≈3%  (1000 gain / 300 loss)
-    pathB = [100, 100, 100, 100, 110, 108, 107, 107, 107, 107]
-    iA = _run_env(_doctrine_env(pathA), start=3)
-    iB = _run_env(_doctrine_env(pathB), start=3)
+    pathB = [100.0]*130 + [110.0, 108.0, 107.0, 107.0]
+    iA = _run_env(_doctrine_env(pathA), start=129)
+    iB = _run_env(_doctrine_env(pathB), start=129)
     assert iA["purity"] < iB["purity"], f"1000/800 (p={iA['purity']:.2f}) must be punished harder than 1000/300 (p={iB['purity']:.2f})"
 
 
 def test_doctrine_bleed_penalty_grows_with_drawdown():
     import numpy as np
-    e = _doctrine_env([100]*6)
-    e.reset(options={"start": 3})
+    e = _doctrine_env([100.0] * 140)
+    e.reset(options={"start": 130})
     # simulate peak rising first (as if portfolio climbed), then test depths
     e.peak = 100.0; e.hwm = 100.0; e.trough = 100.0
     p0 = e._bleed_penalty(100.0)      # no drawdown -> 0
@@ -207,8 +207,8 @@ def test_doctrine_bleed_penalty_grows_with_drawdown():
 def test_doctrine_equal_gain_loss_scores_worst():
     """gain == loss must yield purity ~0, worse than any profitable ratio."""
     import numpy as np
-    e = _doctrine_env([100, 100, 100, 100, 110, 105, 100, 100, 100])  # +10% then full retrace
-    info = _run_env(e, start=3)
+    e = _doctrine_env([100.0] * 130 + [110.0, 105.0, 100.0])  # +10% then full retrace
+    info = _run_env(e, start=129)
     assert abs(info["purity"]) < 0.35, f"equal gain and loss must be ~purity 0, got {info['purity']}"
 
 
@@ -247,8 +247,8 @@ def test_regime_classifier():
 def test_inactivity_bias_punishes_pure_cash():
     """100% cash every step must accumulate negative shaping — the coward
     equilibrium (never trade) is mathematically dominated."""
-    e = _doctrine_env([100, 100, 100, 100, 100, 100, 100, 100])
-    e.reset(options={"start": 3})
+    e = _doctrine_env([100.0] * 140)
+    e.reset(options={"start": 130})
     rewards = []
     while True:
         _, r, t, tr, _ = e.step(np.array([0.0], np.float32))
@@ -259,8 +259,8 @@ def test_inactivity_bias_punishes_pure_cash():
 
 def test_peak_ambition_rewards_new_highs_only():
     """Bonus fires on new highs, is capped, and doesn't repeat on flat."""
-    e = _doctrine_env([100, 100, 100, 100, 110, 110, 110, 121, 121])
-    e.reset(options={"start": 3})
+    e = _doctrine_env([100.0] * 130 + [110.0, 110.0, 121.0, 121.0])
+    e.reset(options={"start": 129})
     while True:
         _, _, t, tr, _ = e.step(np.array([1.0], np.float32))
         if t or tr: break
@@ -273,9 +273,9 @@ def test_ecstasy_fades_with_mastery():
     progressive ambition — the same thrill demands bigger feats."""
     import numpy as np
     from src.training.environment import SpotTradingEnv
-    f = np.zeros((30, 8), np.float32)
-    e = SpotTradingEnv(f, np.full(30, 100.0), 0, 30, window=4, episode_steps=26)
-    e.reset(options={"start": 3})
+    f = np.zeros((140, 8), np.float32)
+    e = SpotTradingEnv(f, np.full(140, 100.0), 0, 140, window=16, episode_steps=10)
+    e.reset(options={"start": 130})
     e.ret_ema = 0.0
     first = e._ecstasy(0.05)
     e.ret_ema = 0.049   # mastered: now expects ~this return
@@ -288,11 +288,11 @@ def test_survival_bonus_for_fleeing_before_crash():
     import numpy as np
     from src.training.environment import SpotTradingEnv
     # flat, then a cliff at the end; agent stays in cash
-    path = [100]*12 + [100, 100, 100, 94.0, 94.0, 94.0, 94.0, 94.0]
+    path = [100.0]*130 + [94.0, 94.0, 94.0, 94.0, 94.0]
     f = np.zeros((len(path), 8), np.float32)
     e = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
-                       window=4, episode_steps=len(path)-5)
-    e.reset(options={"start": 3})
+                       window=16, episode_steps=len(path)-135)
+    e.reset(options={"start": 130})
     survived = 0.0
     while True:
         _, r, t, tr, info = e.step(np.array([0.0], np.float32))
@@ -301,7 +301,7 @@ def test_survival_bonus_for_fleeing_before_crash():
     assert e._survival_check.__doc__ is not None  # sanity
     # direct check: simulate one crash step
     e._prev_close = 100.0
-    e.i = 15  # close[15]=94 -> drop of 6%
+    e.i = len(path)-1  # close=94 -> drop of 6%
     assert e._survival_check() > 0, "fleeing before a 6% crash must pay"
 
 
@@ -311,25 +311,50 @@ def test_timing_bonus_for_surgical_entry():
     directly on a fresh env to keep the unit test pure."""
     import numpy as np
     from src.training.environment import SpotTradingEnv
-    path = [100, 100, 100, 100, 98, 99, 100, 101, 102, 103, 104, 105]
+    path = [100.0]*130 + [98, 99, 100, 101, 102]
     f = np.zeros((len(path), 8), np.float32)
     e = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
-                       window=4, episode_steps=len(path)-5, timing_horizon=4)
-    e.reset(options={"start": 3})
+                       window=16, episode_steps=len(path)-135, timing_horizon=4)
+    e.reset(options={"start": 130})
     e._register_entry(100.0)                      # surgical entry at the dip
     e._pending[0]["step"] = e.steps - 10          # force it to be matured
-    e.i = 11                                      # price now 105
+    e.i = len(path)-1                             # price now 102
     bonus = e._resolve_timing()
     assert bonus > 0, f"surgical entry must earn timing bonus, got {bonus}"
     assert bonus <= e.ecstasy_cap, "timing bonus must be capped"
     # a doomed entry (price below entry after horizon) earns nothing
     e2 = SpotTradingEnv(f, np.asarray(path, dtype=np.float64), 0, len(path),
-                        window=4, episode_steps=len(path)-5, timing_horizon=4)
-    e2.reset(options={"start": 3})
+                        window=16, episode_steps=len(path)-135, timing_horizon=4)
+    e2.reset(options={"start": 130})
     e2._register_entry(105.0)                     # bought the top
     e2._pending[0]["step"] = e2.steps - 10
-    e2.i = 11
+    e2.i = len(path)-1
     assert e2._resolve_timing() == 0.0, "entry that fell must earn no timing bonus"
+
+
+
+def test_adaptive_learning_reacts_to_decline_and_recovery():
+    """Wave 1: eval decline must cut LR and boost entropy; recovery must
+    relax both back. Never stops training."""
+    import json
+    from src.trainer import Trainer
+    cfg = json.load(open('config/default.json'))
+    cfg.update({'model_dir': 'models/bench_t', 'log_dir': 'logs/bench_t'})
+    import os
+    os.makedirs('models/bench_t', exist_ok=True); os.makedirs('logs/bench_t', exist_ok=True)
+    import shutil
+    if os.path.exists('logs/bench_t/metrics.csv'): os.remove('logs/bench_t/metrics.csv')
+    t = Trainer(cfg, device=torch.device('cpu'))
+    # declining phase: 10 evals going down
+    hist = [5.0, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.2, -0.1]
+    t._adapt_on_eval(hist)
+    assert t.adapt['lr_scale'] < 1.0 and t.adapt['ent_scale'] > 1.0, "decline must trigger protection"
+    # recovery phase
+    recovering = hist + [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    t.adapt['cooldown'] = 0
+    t._adapt_on_eval(recovering)
+    assert t.adapt['lr_scale'] >= 1.0 and t.adapt['ent_scale'] <= 1.0, "recovery must relax protection"
+    shutil.rmtree('models/bench_t'); shutil.rmtree('logs/bench_t')
 
 
 if __name__ == "__main__":

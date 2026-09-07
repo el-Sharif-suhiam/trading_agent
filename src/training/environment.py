@@ -52,26 +52,57 @@ class SpotTradingEnv(gym.Env):
         self.ecstasy_cap=ecstasy_cap; self.timing_horizon=timing_horizon
         self.survival_bonus=survival_bonus
         self.peak_ambition_coef=peak_ambition_coef
-        n_state = 4  # position, unrealized pnl, drawdown, time fraction
-        self.observation_space=spaces.Box(-np.inf,np.inf,shape=(window,features.shape[1]+n_state),dtype=np.float32)
+        # multi-frame window layout: fine(1h) + 4h + 12h rows
+        # `window` now means the FINE (1h) portion of the observation.
+        self.window_fine = window
+        self.obs_rows = window + 24 + 8
+        n_state = 5  # position, pnl, drawdown, time fraction, frame flag
+        self.observation_space=spaces.Box(-np.inf,np.inf,shape=(self.obs_rows,features.shape[1]+n_state),dtype=np.float32)
         self.action_space=spaces.Box(0.,1.,shape=(1,),dtype=np.float32)
 
     def _obs(self):
-        market=self.features[self.i-self.window+1:self.i+1]
-        v=self._value(); pos=self.asset*self.close[self.i]/max(v,1e-12)
-        pnl=(v/self.initial_cash-1.0)
-        dd=v/max(self.peak,1e-12)-1.0
-        tf=self.steps/max(self.episode_steps,1)
-        state=np.full((self.window,4),[pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1],dtype=np.float32)
-        return np.concatenate([market,state],axis=1)
+        # fine frame: last `window_fine` 1h candles (default 160 = ~6.7 days)
+        wf = getattr(self, 'window_fine', 160)
+        market = self.features[self.i - wf + 1:self.i + 1]
+        # coarse frames: 24 rows of 4h and 8 rows of 12h, built from the SAME
+        # 1h history (past-only aggregation — no look-ahead). Each coarse row
+        # is the mean of its underlying fine features (scale-free already).
+        f4 = self.features[self.i - 4 * 24 + 1:self.i + 1].reshape(24, 4, -1).mean(axis=1)
+        f12 = self.features[self.i - 12 * 8 + 1:self.i + 1].reshape(8, 12, -1).mean(axis=1)
+        v = self._value(); pos = self.asset * self.close[self.i] / max(v, 1e-12)
+        pnl = (v / self.initial_cash - 1.0)
+        dd = v / max(self.peak, 1e-12) - 1.0
+        tf = self.steps / max(self.episode_steps, 1)
+        state_fine = np.full((wf, 5), [pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1, 0.0], dtype=np.float32)
+        state_c4 = np.full((24, 5), [pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1, 1.0], dtype=np.float32)
+        state_c12 = np.full((8, 5), [pos*2-1, float(np.tanh(pnl*5)), dd*10, tf*2-1, 1.0], dtype=np.float32)
+        return np.concatenate([
+            np.concatenate([market, state_fine], axis=1),
+            np.concatenate([f4, state_c4], axis=1),
+            np.concatenate([f12, state_c12], axis=1),
+        ], axis=0)
+
+    @staticmethod
+    def batch_obs(envs):
+        """Build observations for many envs in ONE call (hot path)."""
+        n = len(envs)
+        rows = envs[0].obs_rows
+        cols = envs[0].features.shape[1] + 5
+        out = np.empty((n, rows, cols), dtype=np.float32)
+        for j, e in enumerate(envs):
+            out[j] = e._obs()
+        return out
 
     def _value(self): return self.cash+self.asset*self.close[self.i]
 
     def reset(self,seed=None,options=None):
         super().reset(seed=seed)
+        # the fine window needs 160 candles behind; the 12h coarse frame
+        # needs 96 — both satisfied by requiring window_fine history.
+        need = max(self.window_fine, 96)
         max_start=self.end-self.episode_steps-1
         if options and "start" in options: self.i=int(options["start"])
-        else: self.i=int(self.np_random.integers(self.start+self.window-1,max_start+1)) if max_start>self.start+self.window-1 else self.start+self.window-1
+        else: self.i=int(self.np_random.integers(self.start+need-1,max_start+1)) if max_start>self.start+need-1 else self.start+need-1
         self.cash=self.initial_cash; self.asset=0.; self.steps=0; self.trades=0
         self.fees=0.; self.slippage_paid=0.
         self.peak=self.initial_cash; self.max_drawdown=0.

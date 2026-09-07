@@ -6,7 +6,7 @@ from ..training.environment import SpotTradingEnv
 
 def run(model, asset, cfg, device):
     steps = asset["end"] - asset["start"] - cfg["window"] - 1
-    start = asset["start"] + cfg["window"] - 1
+    start = asset["start"] + max(cfg["window"], 96) - 1
     env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
                          cfg["window"], max(1, steps), cfg["fee"], cfg["slippage"],
                          cfg["initial_cash"])
@@ -32,7 +32,7 @@ def run_batch(model, assets, cfg, device, batch_size=16):
     envs, starts, remaining = [], [], []
     for asset in assets:
         steps = asset["end"] - asset["start"] - cfg["window"] - 1
-        s = asset["start"] + cfg["window"] - 1
+        s = asset["start"] + max(cfg["window"], 96) - 1
         env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
                              cfg["window"], max(1, steps), cfg["fee"], cfg["slippage"],
                              cfg["initial_cash"])
@@ -94,7 +94,7 @@ def run_regime(model, asset, cfg, device, n_segments=3, seg_steps=512):
     rng = np.random.default_rng(7)
     segs = []
     for _ in range(n_segments):
-        lo = asset["start"] + cfg["window"] - 1
+        lo = asset["start"] + max(cfg["window"], 96) - 1
         hi = asset["end"] - seg_steps - 1
         if hi <= lo:
             continue
@@ -127,7 +127,7 @@ def main():
     a = p.parse_args(); cfg = json.load(open(a.config))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = AssetDataset(cfg["processed_dir"], a.split, cfg["window"])
-    model = TradingAgent(ds.feature_count + 4, cfg["encoder_size"], cfg["hidden_size"], cfg["num_gru_layers"]).to(device)
+    model = TradingAgent(ds.feature_count + 5, cfg["encoder_size"], cfg["hidden_size"], cfg["num_gru_layers"]).to(device)
     ck = torch.load(a.checkpoint, map_location=device)
     model.load_state_dict(ck["model"]); model.eval()
     for x in ds.assets:
