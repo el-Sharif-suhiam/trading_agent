@@ -7,3 +7,5 @@ data/processed/*.joblib
 models/*.pt
 logs/*.log
 logs/state.json
+models/bench/
+logs/bench/
