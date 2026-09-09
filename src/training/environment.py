@@ -66,23 +66,40 @@ class SpotTradingEnv(gym.Env):
         self.action_space=spaces.Box(0.,1.,shape=(1,),dtype=np.float32)
 
     def _coarse_frame(self, rows, group, cache_attr):
-        """Sliding coarse frame via cumulative sums — EXACTLY equivalent to
-        the legacy `features[i-g*rows+1:i+1].reshape(rows,g,-1).mean(1)`
-        layout (groups anchor at i and slide each step; the v2 model was
-        trained on this layout so bit-compatibility matters), computed in
-        O(rows*F) instead of O(rows*group*F) via a running cumsum."""
+        """Sliding coarse frame via cumulative sums — equivalent to the
+        legacy `features[i-g*rows+1:i+1].reshape(rows,g,-1).mean(1)` layout
+        wherever full history exists (groups anchor at i and slide each
+        step). Where history is SHORT (episode start near the asset's
+        beginning), groups that would reach before row 0 are CLAMPED: they
+        average only the rows that exist, or fall back to row 0 — NEVER
+        negative indices (which silently wrap to the array's tail = the
+        FUTURE, a look-ahead leak)."""
         C = self._csum
         lo0 = self._csum_lo  # absolute index of _csum[0]
         i = self.i
-        # group k (0=oldest..rows-1=last): consecutive non-overlapping groups,
-        # the last one ending exactly at i. chunk k spans
-        # [i-g*(rows-k)+1 .. i-g*(rows-k-1)]  (inclusive ends).
         ends = i - group * (rows - 1 - np.arange(rows))      # inclusive
-        hi = C[ends - lo0]
+        # rows whose group would start before the available history: their
+        # end clamps to lo0 + group - 1 at most (a full group of the oldest
+        # rows), or to the oldest row when even one group is unavailable.
+        max_end = self._csum_valid  # last materialized absolute index
+        # clamp to available history: a group's end may never reach before
+        # the first row a FULL group could occupy, and never beyond the
+        # materialized cumsum — this is what kills the negative-index wrap
+        # (which silently read the array's tail = the FUTURE).
+        min_end = lo0  # a short-history group ends at the earliest row
+        ends_c = np.clip(ends, min_end, None)              # no negative wrap
+        ends_c = np.minimum(ends_c, max_end)               # within materialized
+        hi = C[ends_c - lo0]
         lo = np.empty_like(hi)
-        lo[1:] = C[ends[:-1] - lo0]          # start_k - 1 = end_{k-1}
-        lo[0] = C[ends[0] - group - lo0]     # start_0 - 1 (always >= lo0 by margin)
-        return ((hi - lo) / group).astype(np.float32)
+        # prior group's end (>= its own start-1); never below lo0
+        prev_ends = np.maximum(ends_c[:-1], lo0)
+        lo[1:] = C[prev_ends - lo0]
+        lo[0] = C[np.maximum(ends_c[0] - group, lo0) - lo0]
+        # short groups near history start: divide by rows actually covered
+        starts = np.maximum(ends_c - group + 1, lo0)
+        sizes = np.maximum(ends_c - starts + 1, 1)        # rows averaged
+        # hi-lo = sum over [starts..ends]; divide per-row sizes (broadcast)
+        return ((hi - lo) / sizes[:, None]).astype(np.float32)
 
     def _obs(self):
         # fine frame: last `window_fine` 1h candles (default 160 = ~6.7 days)

@@ -95,6 +95,11 @@ def build(raw_dir, processed_dir, train_frac=.70, val_frac=.15, unseen_symbols=N
             sig = transform_ensemble(feat, raw.close, dm, vm, names)
             feat = pd.concat([feat, sig], axis=1)
             xgb_models[sym] = (dm, vm, names)
+            # persist the ensemble so the LIVE harness reproduces training's
+            # exact 95-column diet (without this, live borrowed a different
+            # asset's models and the 3 columns quietly diverged)
+            joblib.dump((dm, vm, names),
+                        os.path.join(processed_dir, f"xgb_{sym}.joblib"))
         if os.path.basename(f).replace(".csv","").upper() in unseen_symbols:
             if use_xgb:
                 # unseen assets: borrow the ensemble trained on the FIRST

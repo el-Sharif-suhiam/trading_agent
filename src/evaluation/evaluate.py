@@ -4,9 +4,16 @@ from ..dataset import AssetDataset
 from ..model import TradingAgent
 from ..training.environment import SpotTradingEnv
 
+def _start_margin(window):
+    """History margin an observation needs: fine window + weekly frame reach
+    (168h x 8 rows). The env itself clamps short history safely now, but a
+    correct margin keeps eval segments comparable to training starts."""
+    return max(window, 96, 168 * 8) - 1
+
+
 def run(model, asset, cfg, device):
     steps = asset["end"] - asset["start"] - cfg["window"] - 1
-    start = asset["start"] + max(cfg["window"], 96) - 1
+    start = asset["start"] + _start_margin(cfg["window"])
     env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
                          cfg["window"], max(1, steps), cfg["fee"], cfg["slippage"],
                          cfg["initial_cash"])
@@ -32,7 +39,7 @@ def run_batch(model, assets, cfg, device, batch_size=16):
     envs, starts, remaining = [], [], []
     for asset in assets:
         steps = asset["end"] - asset["start"] - cfg["window"] - 1
-        s = asset["start"] + max(cfg["window"], 96) - 1
+        s = asset["start"] + _start_margin(cfg["window"])
         env = SpotTradingEnv(asset["features"], asset["close"], asset["start"], asset["end"],
                              cfg["window"], max(1, steps), cfg["fee"], cfg["slippage"],
                              cfg["initial_cash"])
@@ -100,7 +107,7 @@ def run_regime(model, asset, cfg, device, n_segments=3, seg_steps=512):
     rng = np.random.default_rng(7)
     segs = []
     for _ in range(n_segments):
-        lo = asset["start"] + max(cfg["window"], 96) - 1
+        lo = asset["start"] + _start_margin(cfg["window"])
         hi = asset["end"] - seg_steps - 1
         if hi <= lo:
             continue

@@ -41,9 +41,10 @@
 | النموذج | GRU encoder للنافذة + GRU قرار (طبقتان) + رأسا Beta policy وValue — 301,635 باراميتر — `src/model/agent.py` |
 | التدريب | **متوقف عند update 25,852 / 40,000** (وصل حد جلسة 12 ساعة وتوقف نظيفاً بتصميم الجلسات). `best=64.66%` (قمة قديمة مبكرة)، `stable≈0.5-2%` (المقياس الحقيقي — انظر أدناه) |
 | العقيدة | مزروعة كاملة (commit e26c993): نطاق تنفس حر 1.2%، نزيف تربيعي 0.35، نقاء 0.25، ذروات طموحة، نشوة RPE، توقيت جراحي hindsight-clean، نجاة من الانهيار، علاوة تفعيل، **بلا early-stop** |
-| الاختبارات | **20 اختبار ناجح** — `python -m pytest tests/ -q` — يجب أن تبقى خضراء دائماً |
+| الاختبارات | **34 اختبار ناجح** (20 نظام + 14 هارنس/إضافية) — `python -m pytest tests/ -q` — يجب أن تبقى خضراء دائماً |
 | التحكم | `./trainctl.sh {start|resume|stop|status|watch|ui|log|kill|help}` + لوحة curses حية `tui.py` |
-| غير مبني بعد | Harness التشغيل الحي (controller.py هيكل فقط)، OrderManager التنفيذي (هيكل)، CCXT live adapter (مغلق عمداً حتى تفعيل صريح)، أي DEX adapter، Paper trading loop |
+| الهارنس الحي | **مبني (ورقي)**: `./livectl.sh {collect|paper|stop|status|log|dlog|kill|help}` — جامع بيانات مستمر + حلقة ورقية ساعية (17 عملة أو اختيار)، استئناف بتّي، أمان كامل. **Live الحقيقي يبقى معطلاً حتى البوابات (قاعدة 14)** |
+| غير مبني بعد | controller.py الحية (هيكل فقط)، OrderManager التنفيذي (هيكل)، CCXT live adapter (مغلق عمداً حتى تفعيل صريح)، أي DEX adapter |
 
 **ملاحظة تشخيصية مهمة** (آخر قراءة للمالك): آخر 15 امتحاناً كانت سالبة الغالب (-2 إلى -10%) بعد قفزة مبكرة 40-60% في الألفية الأولى — **نمط overfitting محتمل**: حفظ فترات التدريب بدل فهم السوق. المالك وافق على خطة ثلاث موجات لمواجهته: (1) adaptive entropy/LR عند تراجع الامتحانات (لم يُبنَ بعد — أول مهامك المحتملة)، (2) دخول بيانات 2025-2026 الجديدة، (3) عند الركود رغم الاثنين: ترقية معمارية 128→256 مع distillation. **ابدأ من هنا عند استئناف التدريب.**
 
@@ -97,11 +98,34 @@ src/harness/              — state.py (StateStore JSON), decision.py
                             (DecisionEngine: predict(window, hidden) — جاهز
                             للاستخدام)، controller.py (هيكل — يحتاج بناء الحلقة
                             الحية هنا)، lifecycle.py (ثوابت المراحل).
+                            pipeline.py (LivePipeline: خام → 95 عموداً
+                            مطابقاً حرفياً لحمية التدريب — مُتحقق ذهبياً
+                            ضد كل الـ 17 ملف processed: أسوأ فرق 2.3e-5.
+                            أعمدة XGB تُحمّل من data/processed/xgb_*.joblib
+                            [يولّدها dataset.build الآن]، وغيابها = أصفار —
+                            لا ينهار أبداً).
+                            live_env.py (LiveEnv+LiveAccount: غلاف حي فوق
+                            SpotTradingEnv بنفس رياضيات _obs() وstep() تماماً
+                            — بما فيه تكميم float32 للهدف. الاختبار الذهبي:
+                            test_live_obs_matches_training_env_bit_for_bit).
+                            paper_trader.py (حلقة ورقية ساعية: شمعة →
+                            ميزات → قرار → أمان → تنفيذ ورقي → حفظ.
+                            استئناف بتّي من logs/paper/state.json — بما فيه
+                            waterfall. إعفاء بارد: أول دخول من كاش صافٍ
+                            يتجاوز حد 25% للأمر؛ بعده كل rebalance ملتزم).
+                            collector.py (جامع بيانات مستمر: flock + شفاء
+                            فجوات + شموع مغلقة فقط — يعمل حتى مع توقف
+                            التداول، عين لا تنام).
+livectl.sh               — تحكم يدوي بحت في الهارنس الحي (collect/paper/
+                            stop/kill/status/log/dlog) — لا watchdog ولا
+                            إقلاع ذاتي: المالك وحده يشغّل ويوقف.
 src/mcp/server.py         — أدوات MCP: get_status, pause_trading, emergency_stop.
 src/live.py               — placeholder متعمد. الحلقة الحية تُبنى فوق harness.
 trainctl.sh               — كل تحكم التدريب من التيرمينال (read help).
 tui.py                    — لوحة curses (q خروج، p إيقاف عرض — لا يوقف تدريب).
-tests/test_system.py      — 20 اختبار. القاعدة: أي تعديل بلا اختبار جديد
+tests/test_system.py      — 20 اختبار. tests/test_harness.py — 14 اختبار
+                            (أخطرها: تطابق obs الحية مع بيئة التدريب
+                            بتّاً). القاعدة: أي تعديل بلا اختبار جديد
                             له = ممنوع. أي اختبار أحمر = توقف وأصلح فوراً.
 ```
 
@@ -190,7 +214,7 @@ Live بأصغر حجم ممكن (موافقة المالك الصريحة) → �
 ./trainctl.sh status            # الحالة + GPU + آخر تقدم + آخر checkpoint
 ./trainctl.sh ui                # اللوحة الحية (q خروج)
 ./trainctl.sh log 20            # آخر 20 سطر
-.venv/bin/python -m pytest tests/ -q          # 20 اختبار — يجب كلها خضراء
+.venv/bin/python -m pytest tests/ -q          # 34 اختبار — يجب كلها خضراء
 # التقييمات: (المرحلة بعد التدريب — كلها جاهزة)
 .venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split test
 .venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split unseen_test --regimes
