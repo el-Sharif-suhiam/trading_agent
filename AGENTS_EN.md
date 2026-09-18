@@ -110,7 +110,7 @@ tests/test_system.py      — 20 tests. Rule: any change without a new covering
 Watch `stable` (not `best`): consistently climbing above 8-15% = real progress. Stuck near zero or negative after thousands of updates despite the waves below = move to serious overfitting work.
 
 ### Anti-overfitting waves (in agreed order):
-1. **Adaptive learning**: when mean of last 5 evals declines, lower LR automatically and raise entropy temporarily (not built — build in trainer.py carefully, with a test).
+1. **Adaptive learning**: when mean of last 5 evals declines, lower LR automatically and raise entropy temporarily (**built & live** — `_adapt_on_eval` in trainer.py, controlled by adapt_window/adapt_cooldown in config; alone it hit its floor ~×1/16 LR and ×4 entropy with evals stuck at ~-6% — a structural, not dynamic, problem).
 2. **Fresh data**: re-download latest 2025-2026 months for all coins (same data.py commands — they append after deleting old files) then rebuild dataset — model resumes itself on newer data.
 3. **If still stagnant**: offer the owner a network upgrade (hidden 128→256) with distillation: the old model teaches the new one (teacher logits) before replacement — nothing is lost. **Owner's decision required first — not yours.**
 
