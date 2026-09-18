@@ -47,5 +47,9 @@
   "checkpoint_minutes": 5,
   "max_kl": 0.02,
   "adapt_window": 5,
-  "adapt_cooldown": 10
+  "adapt_cooldown": 10,
+  "obs_noise": 0.05,
+  "obs_dropout": 0.1,
+  "weight_decay": 0.0001,
+  "adapt_reset_on_resume": true
 }

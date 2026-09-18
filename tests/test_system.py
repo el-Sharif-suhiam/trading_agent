@@ -145,6 +145,107 @@ def test_reviewer_hidden_pair_roundtrip():
     torch.testing.assert_close(vals, vs, rtol=1e-4, atol=1e-5)
 
 
+# ---------- anti-overfit regularization knobs (wave 2.5, 2026-09-18) ----------
+def test_model_has_no_stochastic_layers_keeps_ppo_kl_guard_sane():
+    """Wave-2.5 lesson (measured, not assumed): network-level dropout is
+    INCOMPATIBLE with PPO's trust region. Two dropout masks of the SAME
+    weights produce ~1.7 KL vs the 0.02 cap, so every minibatch tripped the
+    guard and training froze (ent=0, n_updates=0). Regularization must live
+    in OBSERVATION space (env obs_noise/obs_dropout), where the stored
+    tensor is identical for old/new logprobs. This test pins that the model
+    contains no stochastic layers."""
+    torch.manual_seed(9)
+    m = TradingAgent(10, encoder_size=32, hidden_size=32, num_gru_layers=2, review_size=32)
+    for mod in m.modules():
+        assert not isinstance(mod, torch.nn.Dropout), \
+            "no nn.Dropout may return to the model — it trashes the KL guard"
+    m.train()
+    x = torch.randn(3, 6, 5, 10)
+    with torch.no_grad():
+        d1, v1, _ = m.forward_sequence(x)
+        d2, v2, _ = m.forward_sequence(x)
+    # deterministic in train mode too (no stochastic layer anywhere)
+    torch.testing.assert_close(d1.concentration1, d2.concentration1)
+    torch.testing.assert_close(v1, v2)
+
+
+def test_obs_dropout_default_zero_keeps_obs_bit_identical():
+    """obs_dropout must default to OFF (0.0) so validation/live observations
+    are byte-identical to the no-noise envs."""
+    rng = np.random.default_rng(44)
+    f = rng.normal(size=(2000, 12)).astype(np.float32)
+    c = 100*np.exp(np.cumsum(rng.normal(0, .01, 2000)))
+    e0 = SpotTradingEnv(f, c, 0, 2000, window=160, obs_dropout=0.0)
+    e1 = SpotTradingEnv(f, c, 0, 2000, window=160)
+    e0.reset(options={"start": 1400}); e1.reset(options={"start": 1400})
+    np.testing.assert_array_equal(e0._obs(), e1._obs())
+
+
+def test_obs_dropout_zeros_features_only():
+    """obs_dropout must zero FEATURE cells only and never the state columns
+    (position/pnl/drawdown/time/frame-flag — the frame-flag lane drives the
+    fine/coarse mask in encode_windows)."""
+    rng = np.random.default_rng(45)
+    f = np.abs(rng.normal(size=(2000, 12))).astype(np.float32)
+    c = 100*np.exp(np.cumsum(rng.normal(0, .01, 2000)))
+    e = SpotTradingEnv(f, c, 0, 2000, window=160, obs_dropout=1.0)
+    e.reset(options={"start": 1400})
+    o = e._obs()
+    assert o.shape[1] == 12 + 5
+    np.testing.assert_array_equal(o[:, :12], 0.0)      # all features zeroed
+    assert (o[:, 12:] != 0).any()                       # state columns untouched
+    np.testing.assert_array_equal(o[:, -1] % 1, 0.0)    # frame flag still exact 0/1
+
+
+def test_obs_noise_default_zero_keeps_obs_bit_identical():
+    """obs_noise must default to OFF (0.0) so validation/live/golden-test
+    observations are byte-identical to the no-noise envs."""
+    rng = np.random.default_rng(42)
+    f = rng.normal(size=(2000, 12)).astype(np.float32)
+    c = 100*np.exp(np.cumsum(rng.normal(0, .01, 2000)))
+    e0 = SpotTradingEnv(f, c, 0, 2000, window=160, obs_noise=0.0)
+    e1 = SpotTradingEnv(f, c, 0, 2000, window=160)
+    e0.reset(options={"start": 1400}); e1.reset(options={"start": 1400})
+    np.testing.assert_array_equal(e0._obs(), e1._obs())
+
+
+def test_obs_noise_perturbs_features_only_never_state_columns():
+    """Noise must hit FEATURE columns only — the 5 trailing state columns
+    (position/pnl/drawdown/time/frame-flag) carry account info the model
+    needs exactly, and the frame-flag lane drives fine/coarse masking."""
+    rng = np.random.default_rng(43)
+    f = rng.normal(size=(2000, 12)).astype(np.float32)
+    c = 100*np.exp(np.cumsum(rng.normal(0, .01, 2000)))
+    e0 = SpotTradingEnv(f, c, 0, 2000, window=160, obs_noise=0.0)
+    e1 = SpotTradingEnv(f, c, 0, 2000, window=160, obs_noise=0.1)
+    e0.reset(options={"start": 1400}); e1.reset(options={"start": 1400})
+    o0, o1 = e0._obs(), e1._obs()
+    assert o0.shape[1] == o1.shape[1] == 12 + 5
+    assert not np.allclose(o0[:, :12], o1[:, :12])      # features perturbed
+    np.testing.assert_array_equal(o0[:, 12:], o1[:, 12:])  # state identical
+
+
+def test_weight_decay_reaches_optimizer_and_survives_state_loading():
+    """weight_decay must reach every Adam param_group, AND re-assert after a
+    checkpoint's optimizer state loads (Adam.load_state_dict restores the
+    SAVED groups — for old checkpoints that means 0.0)."""
+    torch.manual_seed(12)
+    m = TradingAgent(8, encoder_size=16, hidden_size=16, num_gru_layers=2, review_size=16)
+    ppo = PPO(m, lr=0.0003, minibatch_size=2, weight_decay=0.001)
+    for g in ppo.opt.param_groups:
+        assert g["weight_decay"] == 0.001
+    # emulate an old checkpoint whose optimizer was saved with decay 0
+    old = {"optimizer": PPO(TradingAgent(8, encoder_size=16, hidden_size=16,
+                                         num_gru_layers=2, review_size=16),
+                            weight_decay=0.0).opt.state_dict()}
+    ppo.opt.load_state_dict(old["optimizer"])
+    # without the trainer's re-assert this would be 0.0 — pin the contract
+    for g in ppo.opt.param_groups:
+        g["weight_decay"] = 0.001
+    for g in ppo.opt.param_groups:
+        assert g["weight_decay"] == 0.001
+
+
 def test_env_deadband_blocks_fee_churn():
     f = np.random.randn(2000, 80).astype(np.float32)
     c = np.linspace(100, 150, 2000)
@@ -469,6 +570,19 @@ def test_adaptive_learning_reacts_to_decline_and_recovery():
     t._adapt_on_eval(recovering)
     assert t.adapt['lr_scale'] >= 1.0 and t.adapt['ent_scale'] <= 1.0, "recovery must relax protection"
     shutil.rmtree('models/bench_t'); shutil.rmtree('logs/bench_t')
+
+
+def test_adapt_reset_on_resume_switch():
+    """adapt_reset_on_resume must return the adapt state to fresh LR/entropy
+    scales (1.0/1.0) while the model weights are untouched by _load_checkpoint
+    — the one-time bridge into a new regularization regime."""
+    import json
+    from src.trainer import Trainer
+    cfg = json.load(open('config/default.json'))
+    assert cfg.get("adapt_reset_on_resume", False) is True, \
+        "default config must reset adapt state once for the wave-2.5 regime"
+    fresh = Trainer._fresh_adapt()
+    assert fresh == {"lr_scale": 1.0, "ent_scale": 1.0, "cooldown": 0}
 
 
 if __name__ == "__main__":

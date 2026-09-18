@@ -4,9 +4,12 @@ from torch import nn
 class PPO:
     def __init__(self, model, lr=3e-4, gamma=.99, gae_lambda=.95, clip_coef=.2,
                  entropy_coef=.005, value_coef=.5, max_grad_norm=.5, epochs=4,
-                 minibatch_size=1024, max_kl=0.02):
+                 minibatch_size=1024, max_kl=0.02, weight_decay=0.0):
         self.model=model
-        self.opt=torch.optim.Adam(model.parameters(),lr=lr,eps=1e-5)
+        # L2 weight decay: mild (1e-4) — regularizes against memorizing
+        # exact training windows (anti-overfit lever; sacred rule: NEVER
+        # tune it so high the model freezes into cash).
+        self.opt=torch.optim.Adam(model.parameters(),lr=lr,eps=1e-5,weight_decay=weight_decay)
         self.gamma=gamma; self.lam=gae_lambda; self.clip=clip_coef
         self.entropy_coef=entropy_coef; self.value_coef=value_coef
         self.max_grad_norm=max_grad_norm

@@ -38,13 +38,14 @@ class Trainer:
         self.base_lr = cfg["learning_rate"]
         self.ppo = PPO(self.model, cfg["learning_rate"], cfg["gamma"], cfg["gae_lambda"], cfg["clip_coef"],
                        cfg["entropy_coef"], cfg["value_coef"], cfg["max_grad_norm"], cfg["ppo_epochs"],
-                       cfg["minibatch_size"], cfg.get("max_kl", 0.02))
+                       cfg["minibatch_size"], cfg.get("max_kl", 0.02),
+                       weight_decay=cfg.get("weight_decay", 0.0))
         self.update_i = 0
         self.best_val = -np.inf
         self.stable_val = -np.inf  # best 10-eval rolling mean (consistency criterion)
         # adaptive learning state: recovers from overfitting stagnation
         # (wave 1 of the agreed anti-overfit plan)
-        self.adapt = {"lr_scale": 1.0, "ent_scale": 1.0, "cooldown": 0}
+        self.adapt = self._fresh_adapt()
         if resume_path:
             self._load_checkpoint(resume_path)
 
@@ -74,7 +75,9 @@ class Trainer:
                                  ecstasy_cap=cfg.get("ecstasy_cap", 0.2),
                                  timing_horizon=cfg.get("timing_horizon", 8),
                                  survival_bonus=cfg.get("survival_bonus", 0.3),
-                                 peak_ambition_coef=cfg.get("peak_ambition_coef", 0.5))
+                                 peak_ambition_coef=cfg.get("peak_ambition_coef", 0.5),
+                                 obs_noise=cfg.get("obs_noise", 0.0),
+                                 obs_dropout=cfg.get("obs_dropout", 0.0))
             env.reset(seed=cfg["seed"] + self.update_i * 1000 + k, options={"start": s})
             envs.append(env)
         return envs
@@ -116,11 +119,24 @@ class Trainer:
             _, last_v, _ = self.model(obs_t[:, None], h)
         return O, A, LP, R, V, D, last_v
 
+    @staticmethod
+    def _fresh_adapt():
+        return {"lr_scale": 1.0, "ent_scale": 1.0, "cooldown": 0}
+
     # ---------- validation ----------
     def validate(self):
         """Returns (mean_return_pct, mean_purity). Purity = (G-L)/(G+L) averaged
         over assets — the user's doctrine: gains must dwarf losses."""
-        rets = eval_run_batch(self.model, self.val_ds.assets, self.cfg, self.device)
+        # keep the model deterministic for exams (defensive: obs_noise/dropout
+        # live in the ENV, which eval envs construct with 0.0 — this also pins
+        # any future stochastic layer to stay out of grading).
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            rets = eval_run_batch(self.model, self.val_ds.assets, self.cfg, self.device)
+        finally:
+            if was_training:
+                self.model.train()
         # purity comes from env info; run_batch exposes it via final infos
         pur = [r.get("purity", 0.0) for r in rets]
         return (float(np.mean([r["return_pct"] for r in rets])),
@@ -157,10 +173,26 @@ class Trainer:
         self.model.load_state_dict(state)
         if "optimizer" in ck:  # distilled checkpoints have no optimizer state
             self.ppo.opt.load_state_dict(ck["optimizer"])
+            # Adam.load_state_dict restores the SAVED param_groups, which for
+            # checkpoints trained before weight_decay held 0.0 — re-assert the
+            # configured value or the new regularizer would silently never fire.
+            for g in self.ppo.opt.param_groups:
+                g["weight_decay"] = self.cfg.get("weight_decay", 0.0)
         self.update_i = ck.get("update", 0)
         self.best_val = ck.get("best_val", -np.inf)
         self.stable_val = ck.get("stable_val", -np.inf)
         self.adapt = ck.get("adapt", self.adapt)
+        if self.cfg.get("adapt_reset_on_resume", False):
+            # One-time hard reset of the ADAPT hyper-parameter state (LR/entropy
+            # scales) — NOT the learned weights. Used when a new regularization
+            # regime begins (obs_noise/dropout/weight_decay, wave 2.5): the old
+            # adaptive state was stuck at LR-floor ×1/16 + entropy-cap ×4 from a
+            # memorization era; letting it carry over would starve the fresh
+            # regularized training of learning rate. `stable`/`best` metrics are
+            # preserved (doctrine: continuity over peaks).
+            self.adapt = self._fresh_adapt()
+            print("  [adapt] hyper-param state reset on resume (fresh LR/entropy)",
+                  flush=True)
         print(f"resumed from {path} at update {self.update_i} "
               f"(best {self.best_val:.2f}%, stable {self.stable_val if self.stable_val > -np.inf else 0:.2f}%)")
 

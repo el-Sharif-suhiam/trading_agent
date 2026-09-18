@@ -40,7 +40,7 @@ These are the owner's explicit conditions across entire sessions. Violating any 
 | Control | `./trainctl.sh {start|resume|stop|status|watch|ui|log|kill|help}` + curses dashboard `tui.py` |
 | Not built yet | Live harness loop (controller.py skeleton), executive OrderManager (skeleton), CCXT live adapter (intentionally locked), any DEX adapter, paper trading loop |
 
-**Diagnostic note**: last 15 evals mostly negative (-2 to -10%) after an early 40-60% jump in the first thousand updates — **probable overfitting pattern**: memorizing training periods instead of understanding markets. Agreed 3-wave counter-plan: (1) adaptive entropy/LR on eval decline (not built yet — likely your first task), (2) add fresh 2025-2026 data, (3) if still stagnant: architecture upgrade 128→256 with distillation. **Start here when resuming training.**
+**Diagnostic note**: last 15 evals mostly negative (-2 to -10%) after an early 40-60% jump in the first thousand updates — **probable overfitting pattern**: memorizing training periods instead of understanding markets. Agreed 3-wave counter-plan — wave 1 (adaptive) built & live, wave 2 (fresh 2025-2026 data) implemented 2026-09-18, **wave 2.5 (obs_noise + obs_dropout + weight_decay, owner-approved on math evidence; dropout moved to observation space after network dropout broke the PPO KL guard — see waves) implemented 2026-09-18, training running** — with architecture upgrade (wave 3) reserved for the owner's decision. **Start here when resuming training.**
 
 ## 2. Code Map
 
@@ -109,10 +109,17 @@ tests/test_system.py      — 20 tests. Rule: any change without a new covering
 ```
 Watch `stable` (not `best`): consistently climbing above 8-15% = real progress. Stuck near zero or negative after thousands of updates despite the waves below = move to serious overfitting work.
 
-### Anti-overfitting waves (in agreed order):
+### Anti-overfitting waves (agreed, evolving order):
 1. **Adaptive learning**: when mean of last 5 evals declines, lower LR automatically and raise entropy temporarily (**built & live** — `_adapt_on_eval` in trainer.py, controlled by adapt_window/adapt_cooldown in config; alone it hit its floor ~×1/16 LR and ×4 entropy with evals stuck at ~-6% — a structural, not dynamic, problem).
-2. **Fresh data**: re-download latest 2025-2026 months for all coins (same data.py commands — they append after deleting old files) then rebuild dataset — model resumes itself on newer data.
-3. **If still stagnant**: offer the owner a network upgrade (hidden 128→256) with distillation: the old model teaches the new one (teacher logits) before replacement — nothing is lost. **Owner's decision required first — not yours.**
+2. **Fresh data**: re-download latest 2025-2026 months for all coins (same data.py commands — they append after deleting old files) then rebuild dataset — model resumes itself on newer data. **Implemented 2026-09-18**: collector filled all 20 coins to 2026-09-18 15:00, dataset rebuilt, training restarted (waves above re-documented in AGENTS.md §2).
+3. **Wave 2.5 — explicit regularization** (implemented 2026-09-18 as the structural response to the stuck −6% evals, owner approved on evidence; then corrected by direct measurement):
+   - `obs_noise` (default 0.05): additive Gaussian on FEATURE columns only, training envs only (live/validation/golden tests stay at 0.0 → bit-for-bit clean). Never touches the 5 state columns — position/pnl/drawdown/time/frame-flag must stay exact.
+   - `obs_dropout` (default 0.1): random zeroing of a fraction of FEATURE cells (dropout in observation space), training envs only, default 0.0. **Measured lesson, not assumption**: we first tried NETWORK dropout (GRU inter-layer + decision-stream head, 0.15) and discovered it BREAKS PPO's KL guard — two dropout masks over the SAME weights yield KL≈1.7 vs the 0.02 cap, so every minibatch stopped early (ent=0.0, n_updates=0 — a frozen "training" worse than none). Regularization must live in OBSERVATION space, where it bakes into the stored obs tensor and the guard sees identical inputs for old/new logprobs, measuring only true drift (after the fix: same-weights KL == 0.0 exactly).
+   - `weight_decay` (default 1e-4): Adam L2. **Gotcha wired**: `Adam.load_state_dict` restores the SAVED param_groups (old checkpoints hold 0.0) — the trainer re-asserts the configured value right after resume.
+   - `adapt_reset_on_resume` (default true, ONE-time): resets the adaptive LR/entropy state to fresh 1.0/1.0 on resume — the old state was stuck at floor-×1/16 + cap-×4 from the memorization era and would starve the fresh regularized training; learned WEIGHTS are untouched (`stable`/`best` preserved).
+   All keys default to 0.0 in the constructors so old checkpoints load unchanged (verified: 0 extra/missing state_dict keys; the model has NO stochastic layers — test `test_model_has_no_stochastic_layers_keeps_ppo_kl_guard_sane` forbids dropout from returning to the network). New unit tests: 41 total green.
+   **Immediate-recovery proof**: after the fix `kl` returned from 1.7 to 0.017–0.020 (inside the trust region) and `ent` from 0 to -0.7..-0.9; proper learning resumed from checkpoint 26547.
+4. **If still stagnant** (owner's decision only): architecture upgrade (hidden 128→256) with distillation — the old model teaches the new one (teacher logits) before replacement. **Owner's decision required first — not yours.**
 
 ### Then — the gates (mandatory order):
 ```

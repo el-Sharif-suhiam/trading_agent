@@ -40,11 +40,22 @@ class SpotTradingEnv(gym.Env):
                  bleed_start=0.012, bleed_max=0.05, bleed_penalty=0.35,
                  purity_coef=0.25, trend_patience_coef=0.15,
                  ecstasy_cap=0.2, timing_horizon=8, survival_bonus=0.3,
-                 peak_ambition_coef=0.5):
+                 peak_ambition_coef=0.5, obs_noise=0.0, obs_dropout=0.0):
         self.features=features; self.close=close; self.start=start; self.end=end
         self.window=window; self.episode_steps=episode_steps
         self.fee=fee; self.slippage=slippage; self.initial_cash=initial_cash
         self.min_trade_fraction=min_trade_fraction
+        # anti-overfit (wave 2.5): observation-space regularization on FEATURE
+        # columns only. Both are applied BEFORE the codec in _obs() and are
+        # baked into the stored observation tensor, so PPO's KL guard measures
+        # TRUE policy drift (identical inputs for old/new logprobs). Network
+        # dropout was tried first and REJECTED: it draws fresh masks per
+        # forward, inflating rollout-vs-update KL to ~1.7 vs the 0.02 cap and
+        # freezing all updates. obs_noise = additive Gaussian; obs_dropout =
+        # random zeroing of a fraction of feature cells. Training-only:
+        # eval/live construct with default 0.0 -> bit-for-bit clean.
+        self.obs_noise = float(obs_noise)
+        self.obs_dropout = float(obs_dropout)
         # doctrine params
         self.bleed_start=bleed_start; self.bleed_max=bleed_max
         self.bleed_penalty=bleed_penalty; self.purity_coef=purity_coef
@@ -126,13 +137,28 @@ class SpotTradingEnv(gym.Env):
         state_c12 = np.broadcast_to(row_coarse, (8, 5))
         state_fd = np.broadcast_to(row_coarse, (self.n_daily, 5))
         state_fw = np.broadcast_to(row_coarse, (self.n_weekly, 5))
-        return np.concatenate([
+        obs = np.concatenate([
             np.concatenate([market, state_fine], axis=1),
             np.concatenate([f4, state_c4], axis=1),
             np.concatenate([f12, state_c12], axis=1),
             np.concatenate([fd, state_fd], axis=1),
             np.concatenate([fw, state_fw], axis=1),
         ], axis=0)
+        # anti-overfit obs regularization: FEATURE columns only, NEVER the 5
+        # state columns (frame-flag last col must stay exactly 0/1 —
+        # encode_windows splits fine/coarse on it). Default 0.0 ->
+        # validation/live stay identical. Zeroed cells via obs_dropout make
+        # the net robust to missing inputs; Gaussian fills the rest.
+        if self.obs_noise > 0 or self.obs_dropout > 0:
+            obs = obs.copy()
+            f = self.features.shape[1]
+            rng = getattr(self, "np_random", None) or np.random
+            if self.obs_dropout > 0:
+                keep = rng.random((obs.shape[0], f)) >= self.obs_dropout
+                obs[:, :f] *= keep.astype(np.float32)
+            if self.obs_noise > 0:
+                obs[:, :f] += rng.normal(0.0, self.obs_noise, size=(obs.shape[0], f)).astype(np.float32)
+        return obs
 
     @staticmethod
     def batch_obs(envs):
