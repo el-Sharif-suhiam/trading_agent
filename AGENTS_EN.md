@@ -42,6 +42,22 @@ These are the owner's explicit conditions across entire sessions. Violating any 
 
 **Diagnostic note**: last 15 evals mostly negative (-2 to -10%) after an early 40-60% jump in the first thousand updates — **probable overfitting pattern**: memorizing training periods instead of understanding markets. Agreed 3-wave counter-plan — wave 1 (adaptive) built & live, wave 2 (fresh 2025-2026 data) implemented 2026-09-18, **wave 2.5 (obs_noise + obs_dropout + weight_decay, owner-approved on math evidence; dropout moved to observation space after network dropout broke the PPO KL guard — see waves) implemented 2026-09-18, training running** — with architecture upgrade (wave 3) reserved for the owner's decision. **Start here when resuming training.**
 
+### Repair wave W — 2026-10-28 (deep analysis + fixes, owner-approved)
+
+**Measured diagnosis (now the reference)**: 27,743 updates (~123 GPU-hours) produced **zero out-of-sample alpha**.
+- Reward decomposed term-by-term (reward_audit): the bleed penalty carried **22× the variance of the money signal** (−0.138/step vs money std 0.0074) → PPO learned drawdown-avoidance, not money-making; inactivity_bias 0.00015 = 0.1% of the bleed cost → "cowardice" nearly free — exactly the inversion of doctrine #9 (commit 2752c9d).
+- Measurement was broken: the exam was ONE ~8,000-step episode (mismatched with 512-step training) + evaluate/backtest **crashed** on any post-torch.compile checkpoint → the gates were never actually run on these models.
+- **Truth matrix (fair, 512h segments)**: latest train alpha +12.5% (t=5.1) vs validation/test/unseen ≈ 0 → **memorization mathematically confirmed**. purity negative in every evaluation without exception.
+- signal_probe (W5): a thin but real 24h directional signal (OOS AUC 0.522 mean, 17/17 assets >0.50) → continued training is worth it; hope lies in fee-aware execution management, not richer prediction.
+
+**Fixes implemented** (each unit: tests + commit):
+1. **W1 Measurement**: `src/model/ckpt.py` (compat loader) + `src/evaluation/fair_eval.py` (N×512h segments matching training, alpha vs buy-hold on the same candles, bit-exact batch invariance) + trainer.validate() now fair-alpha + `eval_history` persisted inside checkpoints + metric_version (legacy checkpoints restart grading at −inf, weights untouched) + legacy metrics.csv rotated to metrics_pre_fair.csv.
+2. **W2 Data**: collector running, gap-filled to 2026-10-28; final Holdout = Oct+ (never trained on; data must be ≤7 days old at any gate).
+3. **W3 Doctrine recalibration**: bleed_penalty 0.35→**0.004**, new cash_drag **0.002** (sitting in cash finally costs), timing ×0.10, ecstasy ×0.25 — **money-dominance gate PASS (money variance share 73.7%)** — re-run `reward_audit` after any coefficient change.
+4. **W4 recalibration run**: resumed from latest.pt (never from scratch — rule 12) with pre-agreed kill criteria: fair validation alpha ≥ +0.5% and t > 2, purity > 0, train↔OOS gap < 5pp. Failure = data for the report, not for spin.
+
+**Reference**: `logs/eval_baseline.md` (pre-repair numbers).
+
 ## 2. Code Map
 
 ```
@@ -79,10 +95,21 @@ src/trainer.py            — session engine: Trainer class + resume + time
                             × purity — **this is the production file**) +
                             metrics.csv + NO EARLY STOP (sacred rule #6).
 src/train.py              — thin CLI wrapper over trainer.py.
-src/evaluation/evaluate.py — run() sequential, run_batch() parallel (verified
-                            identical results), classify_regime + run_regime
-                            (up/down/sideways classified evals — use --regimes),
-                            purity in results.
+src/evaluation/evaluate.py — run() sequential, run_batch() parallel, classify_regime
+                            + run_regime (up/down/sideways classified evals —
+                            use --regimes), purity in results.
+                            **--mode segments (ALWAYS use it for decisions)**:
+                            the fair 512h exam matching training (from fair_eval).
+src/evaluation/fair_eval.py — W1: fair exam protocol (N×512h rotating segments,
+                            alpha vs buy-hold on identical candles, bit-exact
+                            batch invariance, stable_score = window-10 × purity).
+src/model/ckpt.py          — W1: torch.compile-compatible checkpoint loading
+                            (strip/add _orig_mod) — every reader goes through it.
+src/evaluation/reward_audit.py — W3: per-step reward decomposition + the
+                            money-dominance gate (money std >= 2× every term;
+                            must always be PASS).
+src/evaluation/signal_probe.py — W5: cheap truth check (24h-direction OOS AUC
+                            — before burning GPU).
 src/evaluation/backtest.py — evaluation on a specific split.
 src/execution/           — safety.py (limits: max_order_fraction,
                             max_daily_loss, stale data), order_manager.py
@@ -241,6 +268,10 @@ There is NO CCXT for ICP DEXs — each adapter is built manually. General DEX ad
 | Look-ahead features | `rolling(center=True)` saw the future — fake results | `test_features_prefix_invariance` |
 | Negative slices | sampling without window margin = random crashes | `dataset.sample()` guard |
 | Lethal penalty dose | bleed_penalty=1.5 + purity=0.8 produced a **frozen model** (ent=-15, zero trades, val=0 forever) | current calibration (0.35/0.25) + inactivity tests — if you see ent<-8 and val=0 for long: penalty overdosed again |
+| Hidden dominant penalty | bleed 0.35/step carried 22× the money variance across 27k updates with zero OOS alpha (diagnosed 2026-10-28) | reward_audit + money-dominance gate — must always PASS |
+| Measuring on the wrong distribution | exam = one 8,000-step episode (training is 512) → best/stable frozen since update 550 | fair_eval (512h segments) — legacy measurement retired |
+| Broken gate tool | evaluate/backtest crashed on compiled checkpoints (torch.compile prefix) → gates never actually ran | `src/model/ckpt.py` — every checkpoint read passes through it |
+| Nearly-free cowardice | inactivity 0.00015 vs bleed −0.138: sitting in cash cost 0.1% of the pain | cash_drag=0.002 (W3) — doctrine #9 finally balanced |
 | Lucky peak locksout | old early-stop compared against the all-time best → an early 26% killed a session | now: no early-stop at all + stable metric |
 | Window mean-pooling | lost candle order within the window | current window-GRU encoder |
 | Trusting best= as success | passing peaks mean nothing | watch stable only (10-eval mean × purity) |
@@ -253,11 +284,13 @@ There is NO CCXT for ICP DEXs — each adapter is built manually. General DEX ad
 ./trainctl.sh status            # state + GPU + last progress + last checkpoint
 ./trainctl.sh ui                # live dashboard (q to quit)
 ./trainctl.sh log 20            # last 20 lines
-.venv/bin/python -m pytest tests/ -q          # 20 tests — all must be green
-# Evaluations (post-training phase — all ready):
-.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split test
-.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split unseen_test --regimes
-# quick eval trend check:
+.venv/bin/python -m pytest tests/ -q          # 49 tests — all must be green
+# Evaluations (post-training phase — ALL in segments mode):
+.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split test --mode segments
+.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split unseen_test --mode segments --regimes
+# money-dominance gate (must be PASS after any coefficient change):
+.venv/bin/python -m src.evaluation.reward_audit --checkpoint models/latest.pt
+# quick eval trend check (col 11 = fair alpha, 12 = stable, 13 = purity):
 awk -F',' 'NR>1 && $11!="" {print $1, $11}' logs/metrics.csv | tail -20
 ```
 

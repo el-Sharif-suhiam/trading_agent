@@ -48,6 +48,22 @@
 
 **ملاحظة تشخيصية مهمة** (آخر قراءة للمالك): آخر 15 امتحاناً كانت سالبة الغالب (-2 إلى -10%) بعد قفزة مبكرة 40-60% في الألفية الأولى — **نمط overfitting محتمل**: حفظ فترات التدريب بدل فهم السوق. المالك وافق على خطة موجات لمواجهته: (1) adaptive entropy/LR عند تراجع الامتحانات (**مبنية وفعّالة في trainer.py — `_adapt_on_eval`:** تعمل من update ~2600، خفّضت LR إلى قاعه ~×1/16 ورفعت entropy إلى سقفه ×4 نحو 21+ مرة، لكن الامتحانات بقيت ~-6% — أي أن المشكلة بنائية لا ديناميكية)، (2) دخول بيانات 2025-2026 الجديدة (**نُفّذت 2026-09-18**: الجامع ملأ كل العملات حتى 2026-09-18 ثم أُعيد بناء dataset — التدريب استؤنف فوق checkpoint 26375)، (3) **موجة 2.5 — تنظيم صريح (نُفّذت 2026-09-18 بموافقة المالك على دليل رياضي، ثم صُحّحت هندسياً بالقياس المباشر)** — obs_noise + obs_dropout + weight_decay + إعادة تعيين حالة adapt لمرة واحدة (انظر "الموجات" أدناه)، (4) عند الركود رغم كل ذلك: ترقية معمارية 128→256 مع distillation (**قرار المالك حصراً — الناقلة الأخيرة**). **ابدأ من هنا عند استئناف التدريب.**
 
+### موجة الاصلاح W — 2026-10-28 (تحليل عميق + إصلاحات بموافقة المالك)
+
+**التشخيص المُقاس (وأصبح مرجعاً)**: 27,743 تحديثاً (~123 ساعة GPU) أنتجت **صفر alpha خارجي**.
+- فُكّكت المكافأة مكوناً-مكوناً (reward_audit): عقوبة النزيف كانت تحمل **22× تباين إشارة المال** (−0.138/خطوة مقابل money std 0.0074) → PPO تعلّم تجنب drawdown لا صناعة مال؛ وinactivity_bias 0.00015 = 0.1% من ثمن النزيف → "الجبن" شبه مجاني — بالضبط انقلاب doctrine #9 الذي حذر منه سابقاً (commit 2752c9d).
+- القياس كان مكسوراً: الامتحان = حلقة واحدة 8,000+ خطوة (توزيع لا يطابق التدريب) + أداة evaluate/backtest كانت **تتعطل** على أي checkpoint بعد torch.compile → البوابات لم تُشغَّل قط على هذه النماذج.
+- **مصفوفة الحقيقة (fair, شرائح 512h)**: latest alpha train +12.5% (t=5.1) مقابل validation/test/unseen ≈ 0 → **حفظ (memorization) مؤكد رياضياً**. purity سالبة في كل تقييم دون استثناء.
+- signal_probe (W5): إشارة اتجاه 24h رقيقة لكن حقيقية (AUC OOS 0.522 وسطياً، 17/17 عملات >0.50) → التعلم يستحق المتابعة؛ الأمل في إدارة تنفيذ واعية بالرسوم لا في تنبؤ أغنى.
+
+**الإصلاحات المنفذة** (كل وحدة: اختبارات + commit):
+1. **W1 القياس**: `src/model/ckpt.py` (تحميل متوافق) + `src/evaluation/fair_eval.py` (شرائح 512h مطابقة للتدريب، alpha ضد buy-hold على نفس الشموع، طبقات-ثوابت بتّاً) + trainer.validate() أصبح fair-alpha + `eval_history` محفوظة داخل checkpoints + metric_version (القديمة تستأنف بتصفير best/stable دون لمس الأوزان) + تدوير metrics.csv القديم إلى metrics_pre_fair.csv.
+2. **W2 البيانات**: الجامع شغّال وملأ حتى 2026-10-28؛ Holdout نهائي = أكتوبر+ (لا تدريب عليه؛ شرط عمر ≤7 أيام قبل أي بوابة).
+3. **W3 معايرة العقيدة**: bleed_penalty 0.35→**0.004**، cash_drag جديد **0.002** (الجلوس-في-الكاش يكلّف فعلاً)، timing ×0.10، ecstasy ×0.25 — **بوابة السيطرة النقدية PASS (حصة تباين المال 73.7%)** — `reward_audit` يُعاد بعد أي تغيير معاملات.
+4. **W4 جولة إعادة المعايرة**: انطلقت فوق latest.pt (لا من الصفر — قاعدة 12) بمعايير قتل متفق عليها مسبقاً: alpha عادل (validation) ≥ +0.5% و t>2، purity > 0، فجوة train↔OOS < 5 نقاط. الفشل = بيانات للتقرير لا للترويق.
+
+**المرجع**: `logs/eval_baseline.md` (أرقام ما-قبل-الإصلاح).
+
 ## 3. خريطة الكود كاملة (ما كل ملف ولماذا)
 
 ```
@@ -87,10 +103,21 @@ src/trainer.py            — محرك الجلسات: Trainer class + resume + 
                             + NO EARLY STOP (قاعدة مقدسة #6).
                             سطر التقدم: update, portfolio, val, best, stable, ent, kl.
 src/train.py              — غلاف CLI رقيق فوق trainer.py.
-src/evaluation/evaluate.py — run() تسلسلي، run_batch() متوازٍ (متحقق منه
-                            مطابقة النتائج)، classify_regime + run_regime
-                            (امتحانات مصنفة صاعد/نازل/عرضي — استخدم --regimes)،
+src/evaluation/evaluate.py — run() تسلسلي، run_batch() متوازٍ، classify_regime +
+                            run_regime (امتحانات صاعد/نازل/عرضي — --regimes)،
                             purity في النتائج.
+                            **--mode segments (افتراضياً استخدمه للقرارات)**:
+                            الامتحان العادل 512h مطابق للتدريب (من fair_eval).
+src/evaluation/fair_eval.py — W1: بروتوكول الامتحان العادل (شرائح N×512h عشوائية
+                            بمواضع متدورة، alpha ضد buy-hold على نفس الشموع،
+                            دفعة-ثابتة بتّاً، stable_score نافذة-10×نقاء).
+src/model/ckpt.py          — W1: تحميل checkpoints متوافق مع torch.compile
+                            (strip/add _orig_mod) — أي قارئ يمر من هنا.
+src/evaluation/reward_audit.py — W3: تفكيك مكافأة الخطوة مكوناً-مكوناً +
+                            بوابة السيطرة النقدية (money std ≥ 2× كل مصطلح؛
+                            يجب أن يكون PASS دائماً).
+src/evaluation/signal_probe.py — W5: اختبار الحقيقة الرخيص (AUC اتجاه 24h
+                            خارج العينة — قبل حرق GPU).
 src/evaluation/backtest.py — تقييم على split محدد.
 src/execution/            — safety.py (حدود: max_order_fraction, max_daily_loss,
                             stale data), order_manager.py (هيكل تخطيط),
@@ -270,6 +297,10 @@ Live بأصغر حجم ممكن (موافقة المالك الصريحة) → �
 | look-ahead في الميزات | `rolling(center=True)` رأى المستقبل — نتائج وهمية | `test_features_prefix_invariance` |
 | شرائح سالبة | sampling بلا هامش window = انهيارات عشوائية | حارس `dataset.sample()` |
 | عقوبة قاتلة | bleed_penalty=1.5 + purity=0.8 أنتجت **نموذجاً متجمداً** (ent=-15, لا صفقات, val=0 دائماً) | المعايرة الحالية (0.35/0.25) + اختبارات inactivity — لو رأيت ent<-8 وval=0 لفترة طويلة: جرعة العقوبة زائدة مجدداً |
+| عقوبة خفية مهيمنة | bleed=0.35/خطوة حمل 22× تباين المال 27 ألف تحديث بلا alpha خارجي (شُخّصت 2026-10-28) | reward_audit + بوابة السيطرة النقدية — يجب PASS دائماً |
+| قياس على توزيع خاطئ | الامتحان = حلقة 8,000 خطوة (تدريبها 512) → best/stable مجمّدة منذ update 550 | fair_eval (شرائح 512h) — ودّعنا القياس التاريخي القديم |
+| أداة بوابات مكسورة | evaluate/backtest تتعطل على checkpoints المحوّلة (torch.compile prefix) → لا بوابات فعلية | `src/model/ckpt.py` — كل قراءة checkpoint تمر منه |
+| "الجبن" شبه مجاني | inactivity 0.00015 مقابل bleed −0.138: الجلوس في الكاش تكلفته 0.1% من التحمل | cash_drag=0.002 (W3) — عقيدة #9 أخيراً متوازنة |
 | قمة حظ تقفل النظام | early-stop قديم قارن بأفضل قمة تاريخية → 26% مبكرة قتلت جلسة | الآن لا early-stop مطلقاً + stable metric |
 | mean-pooling النافذة | فقد ترتيب الشموع داخل النافذة | window-GRU encoder الحالي |
 | اعتبار best= مؤشر نجاح | قمم عابرة لا تعني شيئاً | راقب stable فقط (متوسط 10 × نقاء) |
@@ -282,11 +313,13 @@ Live بأصغر حجم ممكن (موافقة المالك الصريحة) → �
 ./trainctl.sh status            # الحالة + GPU + آخر تقدم + آخر checkpoint
 ./trainctl.sh ui                # اللوحة الحية (q خروج)
 ./trainctl.sh log 20            # آخر 20 سطر
-.venv/bin/python -m pytest tests/ -q          # 34 اختبار — يجب كلها خضراء
-# التقييمات: (المرحلة بعد التدريب — كلها جاهزة)
-.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split test
-.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split unseen_test --regimes
-# فحص سريع للامتحانات عبر الزمن:
+.venv/bin/python -m pytest tests/ -q          # 49 اختبار — يجب كلها خضراء
+# التقييمات: (المرحلة بعد التدريب — كلها جاهزة — **دائماً بوضع segments**)
+.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split test --mode segments
+.venv/bin/python -m src.evaluation.evaluate --checkpoint models/stable.pt --split unseen_test --mode segments --regimes
+# بوابة السيطرة النقدية (يجب PASS بعد أي تغيير معاملات):
+.venv/bin/python -m src.evaluation.reward_audit --checkpoint models/latest.pt
+# فحص سريع للامتحانات عبر الزمن (عمود 11 = fair alpha، 12 = stable، 13 = purity):
 awk -F',' 'NR>1 && $11!="" {print $1, $11}' logs/metrics.csv | tail -20
 ```
 
