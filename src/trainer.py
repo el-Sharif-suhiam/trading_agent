@@ -84,7 +84,7 @@ class Trainer:
                                  cfg["initial_cash"],
                                  bleed_start=cfg.get("bleed_start", 0.012),
                                  bleed_max=cfg.get("bleed_max", 0.05),
-                                 bleed_penalty=cfg.get("bleed_penalty", 0.35),
+                                 bleed_penalty=cfg.get("bleed_penalty", 0.004),
                                  purity_coef=cfg.get("purity_coef", 0.25),
                                  trend_patience_coef=cfg.get("trend_patience_coef", 0.15),
                                  ecstasy_cap=cfg.get("ecstasy_cap", 0.2),
@@ -92,7 +92,10 @@ class Trainer:
                                  survival_bonus=cfg.get("survival_bonus", 0.3),
                                  peak_ambition_coef=cfg.get("peak_ambition_coef", 0.5),
                                  obs_noise=cfg.get("obs_noise", 0.0),
-                                 obs_dropout=cfg.get("obs_dropout", 0.0))
+                                 obs_dropout=cfg.get("obs_dropout", 0.0),
+                                 cash_drag=cfg.get("cash_drag", 0.0),
+                                 timing_scale=cfg.get("timing_scale", 1.0),
+                                 ecstasy_scale=cfg.get("ecstasy_scale", 1.0))
             env.reset(seed=cfg["seed"] + self.update_i * 1000 + k, options={"start": s})
             envs.append(env)
         return envs

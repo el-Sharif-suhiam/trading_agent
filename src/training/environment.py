@@ -37,10 +37,11 @@ class SpotTradingEnv(gym.Env):
 
     def __init__(self, features, close, start, end, window=96, episode_steps=512,
                  fee=.001, slippage=.0005, initial_cash=10000., min_trade_fraction=0.02,
-                 bleed_start=0.012, bleed_max=0.05, bleed_penalty=0.35,
+                 bleed_start=.012, bleed_max=.05, bleed_penalty=.004,
                  purity_coef=0.25, trend_patience_coef=0.15,
                  ecstasy_cap=0.2, timing_horizon=8, survival_bonus=0.3,
-                 peak_ambition_coef=0.5, obs_noise=0.0, obs_dropout=0.0):
+                 peak_ambition_coef=0.5, obs_noise=0.0, obs_dropout=0.0,
+                 cash_drag=0.002, timing_scale=0.1, ecstasy_scale=0.25):
         self.features=features; self.close=close; self.start=start; self.end=end
         self.window=window; self.episode_steps=episode_steps
         self.fee=fee; self.slippage=slippage; self.initial_cash=initial_cash
@@ -59,6 +60,8 @@ class SpotTradingEnv(gym.Env):
         # doctrine params
         self.bleed_start=bleed_start; self.bleed_max=bleed_max
         self.bleed_penalty=bleed_penalty; self.purity_coef=purity_coef
+        self.cash_drag=float(cash_drag); self.timing_scale=float(timing_scale)
+        self.ecstasy_scale=float(ecstasy_scale)
         self.trend_patience_coef=trend_patience_coef
         self.ecstasy_cap=ecstasy_cap; self.timing_horizon=timing_horizon
         self.survival_bonus=survival_bonus
@@ -242,8 +245,16 @@ class SpotTradingEnv(gym.Env):
         return self.purity_coef * purity * 0.01
 
     def _inactivity_bias(self):
-        if self.asset > 0: return 0.0
-        return -0.00015
+        """CASH DRAG (W3 recalibration): the coward equilibrium must actually
+        cost. Old term was a fixed −0.00015/step — 0.1% of the bleed penalty's
+        cost, so sitting in cash was nearly free and the policy equilibrated
+        at a static ~58% allocation. Replacing it with an invested-fraction
+        aware drag calibrated against the money scale (−0.002/step when
+        ≥90% cash ≈ the hourly money signal × corrective factor)."""
+        invested = self.asset * self.close[self.i] / max(self._value(), 1e-12)
+        if invested > 0.1:
+            return 0.0
+        return -self.cash_drag
 
     def _trend_patience(self, old_value, new_value):
         if self.asset <= 0: return 0.0
@@ -266,14 +277,16 @@ class SpotTradingEnv(gym.Env):
         """Reward Prediction Error: positive surprises above the agent's own
         recent expectations deliver a capped dopamine-like bonus. As the agent
         gets consistently good, EMA rises and the ecstasy fades — demanding
-        ever-higher mastery for the same thrill (progressive ambition)."""
+        ever-higher mastery for the same thrill (progressive ambition).
+        ecstasy_scale (W3): the bonus must amplify learning, never outshout
+        the money term (audit gate: money std >= 2x every non-money term)."""
         expected = self.ret_ema
         rpe = base_ret - expected
         # update expectation EMA (only realized returns, no shaping)
         self.ret_ema = 0.995*self.ret_ema + 0.005*base_ret
         if rpe <= 0: return 0.0
         bonus = min(self.ecstasy_cap, 2.0*rpe)
-        return bonus
+        return self.ecstasy_scale * bonus
 
     def _register_entry(self, entry_price):
         """Schedule a hindsight-clean timing evaluation after `timing_horizon`
@@ -294,7 +307,7 @@ class SpotTradingEnv(gym.Env):
                 # sustained improvement: capped timing bonus
                 bonus += min(move*2.0, self.ecstasy_cap)
             self._pending.remove(p)
-        return float(min(bonus, self.ecstasy_cap))
+        return float(min(bonus, self.ecstasy_cap) * self.timing_scale)
 
     def _survival_check(self):
         """Crash-escape bonus: the agent was in cash (or fled this step) and
