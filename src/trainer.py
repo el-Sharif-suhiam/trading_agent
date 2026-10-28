@@ -5,12 +5,14 @@ import torch
 
 from .dataset import AssetDataset
 from .model import TradingAgent
+from .model.ckpt import load_state_compat
 from .training.environment import SpotTradingEnv
 from .training.ppo import PPO
-from .evaluation.evaluate import run_batch as eval_run_batch
+from .evaluation import fair_eval
 
 
 class Trainer:
+    METRIC_VERSION = 2  # 2 = fair alpha protocol (segments); 1 = legacy full-split return
     def __init__(self, cfg, device=None, resume_path=""):
         self.cfg = cfg
         random.seed(cfg["seed"]); np.random.seed(cfg["seed"]); torch.manual_seed(cfg["seed"])
@@ -43,6 +45,7 @@ class Trainer:
         self.update_i = 0
         self.best_val = -np.inf
         self.stable_val = -np.inf  # best 10-eval rolling mean (consistency criterion)
+        self.eval_records = []     # persisted across resumes (update, alpha, purity)
         # adaptive learning state: recovers from overfitting stagnation
         # (wave 1 of the agreed anti-overfit plan)
         self.adapt = self._fresh_adapt()
@@ -50,11 +53,23 @@ class Trainer:
             self._load_checkpoint(resume_path)
 
         self.csv_path = os.path.join(cfg["log_dir"], "metrics.csv")
+        # metric-regime change (W1): the fair-alpha protocol changes the scale
+        # and meaning of the val column. Preserve the legacy file by renaming
+        # it (data is kept, never deleted) and start a fresh aligned file.
+        legacy_header = "val_return_pct"
+        if os.path.exists(self.csv_path):
+            with open(self.csv_path) as fh:
+                first = fh.readline()
+            if legacy_header in first:
+                pre = self.csv_path.replace("metrics.csv", "metrics_pre_fair.csv")
+                os.replace(self.csv_path, pre)
+                print(f"[w1] legacy metrics rotated to {pre} (val column now = fair alpha %)")
         if not os.path.exists(self.csv_path) or self.update_i == 0:
             with open(self.csv_path, "w", newline="") as fh:
                 csv.writer(fh).writerow(["update", "portfolio_mean", "trades", "reward_mean",
                                          "entropy", "value_loss", "policy_loss", "ratio_clip_frac",
-                                         "kl", "sec_per_update", "val_return_pct", "stable_val_return_pct"])
+                                         "kl", "sec_per_update", "val_fair_alpha_pct",
+                                         "stable_fair_alpha_pct", "val_purity"])
 
     # ---------- rollout ----------
     def _make_envs(self):
@@ -125,22 +140,28 @@ class Trainer:
 
     # ---------- validation ----------
     def validate(self):
-        """Returns (mean_return_pct, mean_purity). Purity = (G-L)/(G+L) averaged
-        over assets — the user's doctrine: gains must dwarf losses."""
-        # keep the model deterministic for exams (defensive: obs_noise/dropout
-        # live in the ENV, which eval envs construct with 0.0 — this also pins
-        # any future stochastic layer to stay out of grading).
+        """FAIR exam (W1 of the repair plan): N×512h episodes shaped exactly
+        like training (same margin, reset-from-cash, rotating random starts),
+        graded on ALPHA vs buy-and-hold on the same candles — not raw return,
+        which only rewards riding a bull market.
+        Returns (mean_alpha_pct, mean_purity). Purity = (G-L)/(G+L) averaged
+        over segments — the user's doctrine: gains must dwarf losses.
+        The model stays deterministic: obs_noise/dropout live in the ENV and
+        eval envs run with 0.0 (bit-identical to grading/live)."""
         was_training = self.model.training
         self.model.eval()
         try:
-            rets = eval_run_batch(self.model, self.val_ds.assets, self.cfg, self.device)
+            res = fair_eval.run_segments(
+                self.model, self.val_ds.assets, self.cfg, self.device,
+                seg_steps=self.cfg.get("rollout_steps", 512),
+                per_asset=self.cfg.get("fair_per_asset", 6),
+                seed=self.update_i,  # rotating segments: no fixture overfitting
+                batch_size=self.cfg.get("fair_batch_size", 32))
         finally:
             if was_training:
                 self.model.train()
-        # purity comes from env info; run_batch exposes it via final infos
-        pur = [r.get("purity", 0.0) for r in rets]
-        return (float(np.mean([r["return_pct"] for r in rets])),
-                float(np.mean(pur)) if pur else 0.0)
+        agg = res["aggregate"]
+        return agg["alpha_mean_pct"], agg["purity"]
 
     # ---------- checkpoints ----------
     def _ckpt(self):
@@ -149,7 +170,9 @@ class Trainer:
                 "stable_val": self.stable_val, "config": self.cfg,
                 "adapt": self.adapt,
                 "feature_count": self.train_ds.feature_count,
-                "state_dim": self.train_ds.feature_count + 5}
+                "state_dim": self.train_ds.feature_count + 5,
+                "metric_version": self.METRIC_VERSION,
+                "eval_history": self.eval_records[-200:]}
 
     def _save(self, name):
         torch.save(self._ckpt(), os.path.join(self.cfg["model_dir"], name))
@@ -162,15 +185,9 @@ class Trainer:
 
     def _load_checkpoint(self, path):
         ck = torch.load(path, map_location=self.device)
-        state = ck["model"]
-        # strip torch.compile's _orig_mod. prefix if present (checkpoint
-        # may come from a compiled or eager session)
-        if any(k.startswith("_orig_mod.") for k in state):
-            state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
-        # or add it if the running model is compiled
-        if any(not k.startswith("_orig_mod.") for k in state) and hasattr(self.model, "_orig_mod"):
-            state = {f"_orig_mod.{k}": v for k, v in state.items()}
-        self.model.load_state_dict(state)
+        # strip/add torch.compile's _orig_mod. prefix via the shared compat
+        # util (same logic must serve save-time and every reader)
+        load_state_compat(self.model, ck["model"])
         if "optimizer" in ck:  # distilled checkpoints have no optimizer state
             self.ppo.opt.load_state_dict(ck["optimizer"])
             # Adam.load_state_dict restores the SAVED param_groups, which for
@@ -182,6 +199,17 @@ class Trainer:
         self.best_val = ck.get("best_val", -np.inf)
         self.stable_val = ck.get("stable_val", -np.inf)
         self.adapt = ck.get("adapt", self.adapt)
+        self.eval_records = ck.get("eval_history", [])
+        if int(ck.get("metric_version", 1)) < self.METRIC_VERSION:
+            # pre-fair checkpoints graded best/stable on the legacy full-episode
+            # return — a different scale AND a different distribution. Their
+            # numbers cannot compete against fair alphas; grading restarts at
+            # -inf and the legacy checkpoints stay untouched on disk.
+            self.best_val = -np.inf
+            self.stable_val = -np.inf
+            self.eval_records = []
+            print("  [w1] legacy metric checkpoint detected: best/stable grading "
+                  "restarts under the FAIR alpha protocol (files untouched)")
         if self.cfg.get("adapt_reset_on_resume", False):
             # One-time hard reset of the ADAPT hyper-parameter state (LR/entropy
             # scales) — NOT the learned weights. Used when a new regularization
@@ -236,7 +264,8 @@ class Trainer:
         budget = time_budget_hours if time_budget_hours is not None else cfg.get("time_budget_hours", 0)
         deadline = time.time() + budget * 3600 if budget > 0 else None
         last_ckpt = time.time()
-        val_hist = []  # recent validation returns (consistency tracking)
+        val_hist = [r["alpha"] for r in self.eval_records]
+        pur_hist = [r["purity"] for r in self.eval_records]  # restored across resumes now
         print(f"device={self.device} assets={len(self.train_ds.assets)} "
               f"features={self.train_ds.feature_count}+4 updates={cfg['updates']} "
               f"budget={budget or 'inf'}h  (touch {stop_file} to stop safely)")
@@ -270,26 +299,27 @@ class Trainer:
             if self.update_i % cfg.get("eval_every", 25) == 0:
                 vret, vpurity = self.validate()
                 row[10] = round(vret, 3)
-                val_hist.append(vret)
+                row.append(round(vpurity, 3))
+                self.eval_records.append({"update": self.update_i,
+                                          "alpha": vret, "purity": vpurity})
+                val_hist.append(vret); pur_hist.append(vpurity)
                 if vret > self.best_val:
                     self.best_val = vret; self._save("best.pt")
-                # consistency criterion: mean of last 10 evals.
-                # A model that scores ~the same every exam is worth far more
-                # than one that hit a lucky peak once.
-                if len(val_hist) >= 10:
-                    m = float(np.mean(val_hist[-10:]))
-                    # doctrine-weighted score: return must come with purity
-                    # (gains dwarfing losses). Purity in [-1,1] boosts or
-                    # discounts the raw return mean.
-                    score = m * (0.5 + 0.5 * max(0.0, vpurity))
-                    if score > self.stable_val:
-                        self.stable_val = score
-                        self._save("stable.pt")
+                # consistency criterion: mean of last 10 evals × purity
+                # discount. A model that scores ~the same every exam is worth
+                # far more than one that hit a lucky peak once
+                # (fair-eval core: the score MUST come from the last-10 window).
+                score = fair_eval.stable_score(val_hist, pur_hist)
+                if score is not None and score > self.stable_val:
+                    self.stable_val = score
+                    self._save("stable.pt")
                 # adaptive learning: react to decline/recovery (wave 1)
                 self._adapt_on_eval(val_hist)
                 # NOTE: no early stop. The system NEVER decides it cannot
                 # improve — it saves its best state and keeps trying with
                 # everything it has (user's explicit requirement).
+            elif len(row) == 12:
+                row.append("")  # keep purity column aligned on non-eval rows
             with open(self.csv_path, "a", newline="") as fh:
                 csv.writer(fh).writerow(row)
             print(f"update {self.update_i}/{cfg['updates']} portfolio={row[1]:.0f} "

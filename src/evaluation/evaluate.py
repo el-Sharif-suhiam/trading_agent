@@ -2,7 +2,9 @@ import argparse, json
 import numpy as np, torch
 from ..dataset import AssetDataset
 from ..model import TradingAgent
+from ..model.ckpt import load_checkpoint
 from ..training.environment import SpotTradingEnv
+from .fair_eval import run_segments as fair_run_segments
 
 def _start_margin(window):
     """History margin an observation needs: fine window + weekly frame reach
@@ -137,12 +139,29 @@ def main():
     p.add_argument("--checkpoint", default="models/latest.pt")
     p.add_argument("--split", default="validation", choices=["validation", "test", "unseen_test"])
     p.add_argument("--regimes", action="store_true", help="also report per-regime (up/down/sideways) results")
+    p.add_argument("--mode", default="full", choices=["full", "segments"],
+                   help="full = one continuous episode per asset (legacy); "
+                        "segments = N×512h fair episodes matching training (RECOMMENDED)")
     a = p.parse_args(); cfg = json.load(open(a.config))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = AssetDataset(cfg["processed_dir"], a.split, cfg["window"])
     model = TradingAgent(ds.feature_count + 5, cfg["encoder_size"], cfg["hidden_size"], cfg["num_gru_layers"]).to(device)
-    ck = torch.load(a.checkpoint, map_location=device)
-    model.load_state_dict(ck["model"]); model.eval()
+    ck = load_checkpoint(model, a.checkpoint, map_location=device, weights_only=False)
+    model.eval()
+    if a.mode == "segments":
+        res = fair_run_segments(model, ds.assets, cfg, device,
+                                batch_size=cfg.get("fair_batch_size", 32))
+        agg = res["aggregate"]
+        print(f"[fair] {a.checkpoint} | {a.split} | update={ck.get('update')} "
+              f"| {agg['n_segments']} segments × {cfg.get('rollout_steps', 512)}h")
+        print(f"  alpha mean {agg['alpha_mean_pct']:+.2f}%  median {agg['alpha_median_pct']:+.2f}%  "
+              f"t={agg['alpha_t']:+.2f}")
+        print(f"  beat buyhold {100*agg['beat_buyhold']:.0f}%  positive {100*agg['positive']:.0f}%  "
+              f"purity {agg['purity']:+.3f}  dd {agg['max_drawdown']*100:.1f}%")
+        print(f"  model {agg['model_ret_pct']:+.2f}%  buyhold {agg['buyhold_ret_pct']:+.2f}%")
+        for pa in res["per_asset"]:
+            print(f"    {pa['symbol']:12s} n={pa['n']:2d} alpha={pa['alpha_pct']:+7.2f}% purity={pa['purity']:+.2f}")
+        return
     for x in ds.assets:
         print(x["symbol"], run(model, x, cfg, device))
         if a.regimes:
