@@ -12,7 +12,7 @@ These are the owner's explicit conditions across entire sessions. Violating any 
 1. **Spot only. No Futures, no Margin, no Leverage, no Short, no derivatives of any kind.** Reason: the owner's religious conviction (futures are haram). Do not discuss, do not "evolve" toward it, do not suggest it even as an option. Any leverage talk = absolutely forbidden.
 2. **No interest of any form**: no staking, no lending, no yield, no lending out the portfolio, no interest on cash. Cash in the system = raw idle cash.
 3. **One shared general model** learning from many coins as separate training episodes — NOT a model per coin, NOT a portfolio traded together. One coin per episode.
-4. **Technical schools (Elliott/Wyckoff/Gann/Cycles/MTF) are feature inputs — NOT hard-coded BUY/SELL rules.** The model discovers their relationships itself. Manual decision rules are forbidden.
+4. **Technical schools (Elliott/Wyckoff/Gann/Cycles/MTF) may now propose decisions** — they are allowed to generate candidate BUY/SELL signals, **but the model is the one that experiments and decides what to trust through learning** — nothing is imposed from above (owner amendment 2026-10-30: lifted the rigidity of the previous version that confined them to features only). Standing principle: no manual rule is forced onto the final decision — trust is earned through learning, not decree.
 5. **Objective = portfolio dollar value after fees and slippage.** No intermediate technical metric.
 6. **No early-stopping, ever**: the system NEVER decides it cannot improve — it saves its best states (best/stable) and keeps trying always. (Owner's literal request after an early-stop ruined a training session.)
 7. **Consistency over peak**: one lucky exam peak is worthless. The metric: mean of last 10 evals (`stable`). A consistent +8% model beats a one-off +60%.
@@ -23,7 +23,7 @@ These are the owner's explicit conditions across entire sessions. Violating any 
 12. **Any new idea builds on existing learning** — resume from checkpoint — never retrain from scratch (sole exception: radical architecture change — and even then distillation is discussed first).
 13. **MCP/OpenCode is an optional control interface** — the system runs independently 24/7 without them.
 14. **Live is disabled by default** — enabled explicitly only after passing: Training → Validation → Unseen → Backtest → Paper Trading → small Live Spot then gradual scaling.
-15. **Living money is entirely outside the system** — the system trades growth money only. (Owner's agreed financial-independence model: grow capital gradually, no withdrawals before 6 live green months.)
+15. **[Abrogated by owner's decision 2026-10-30]** — used to read: "Living money is entirely outside the system / no withdrawals before 6 live green months." The owner lifted this constraint: money boundaries are now exclusively his own decision, managed whenever he chooses — never imposed by the system or the agent. (Numbering preserved as-is so every cross-reference in files and code stays valid.)
 
 ---
 
