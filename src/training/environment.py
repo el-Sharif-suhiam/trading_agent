@@ -13,8 +13,9 @@ class SpotTradingEnv(gym.Env):
                      forever is mathematically dominated by smart trading.
       inactivity   : tiny per-step opportunity cost when 100% cash —
                      the coward equilibrium (never trade) always loses.
-      purity       : waterfall gain/loss accounting; (G-L)/(G+L) rewarded —
-                     gains must dwarf losses (user doctrine 1000/800 vs 1000/300).
+      purity       : PER-TRADE waterfall (metric_version 3): realized round-trip
+                     gains vs losses, (G-L)/(G+L) rewarded — gains must dwarf
+                     losses (user doctrine 1000/800 vs 1000/300).
       patience     : staying invested while profitable in an uptrend is
                      rewarded (let winners run).
       peak_ambition: log-scaled bonus on each NEW portfolio high — climbing
@@ -207,8 +208,13 @@ class SpotTradingEnv(gym.Env):
         np.cumsum(self.features[lo_base:self.i + 1].astype(np.float64),
                   axis=0, out=self._csum[:self.i + 1 - lo_base])
         self._csum_valid = self.i
-        # doctrine trackers
-        self.hwm=None; self.trough=None
+        # doctrine trackers — PER-TRADE waterfall (metric_version 3, owner
+        # doctrine 1000/800 vs 1000/300 at TRADE level): gross_gain/gross_loss
+        # accumulate REALIZED round-trip P&L (closed sells vs average entry
+        # basis incl. fees). The old equity-path waterfall measured the market
+        # regime, not the trader: buy-hold scored the same -0.60 purity as the
+        # model in bearish windows and NO segment of 102 ever went positive.
+        self.basis_qty=0.0; self.basis_cost=0.0
         self.gross_gain=0.0; self.gross_loss=0.0
         # ecstasy / expectation tracking (EMA of recent step returns)
         self.ret_ema=0.0
@@ -228,21 +234,23 @@ class SpotTradingEnv(gym.Env):
         x = min((dd - self.bleed_start)/(self.bleed_max - self.bleed_start), 1.0)
         return -self.bleed_penalty * x * x
 
-    def _track_waterfall(self, value, basis=None):
-        if self.hwm is None and basis is not None:
-            self.hwm = float(basis); self.trough = float(basis)
-        elif self.hwm is None:
-            self.hwm = value; self.trough = value
-        elif value > self.hwm:
-            self.gross_gain += value - self.hwm
-            self.hwm = value; self.trough = value
-        elif value < self.trough:
-            self.gross_loss += self.trough - value
-            self.trough = value
+    def _record_realized(self, realized):
+        """Trade-level waterfall bookkeeping: one closed round-trip realized
+        P&L either lands in gross_gain or gross_loss. purity=(G-L)/(G+L) —
+        the owner's doctrine verbatim (1000/800 guilty, 1000/300 acceptable)."""
+        if realized > 0:
+            self.gross_gain += realized
+        elif realized < 0:
+            self.gross_loss += -realized
+        return realized
+
+    def _purity(self):
         G, L = self.gross_gain, self.gross_loss
         if G + L < 1e-12: return 0.0
-        purity = (G - L)/(G + L)
-        return self.purity_coef * purity * 0.01
+        return (G - L)/(G + L)
+
+    def _purity_term(self):
+        return self.purity_coef * self._purity() * 0.01
 
     def _inactivity_bias(self):
         """CASH DRAG (W3 recalibration): the coward equilibrium must actually
@@ -329,9 +337,19 @@ class SpotTradingEnv(gym.Env):
                 gross=delta*price*(1+self.slippage); cost=gross/(1-self.fee)
                 if cost>self.cash:
                     delta=self.cash*(1-self.fee)/(price*(1+self.slippage)); gross=delta*price*(1+self.slippage); cost=gross/(1-self.fee)
-                self.cash-=cost; self.asset+=delta; self.fees+=gross*self.fee; self.slippage_paid+=delta*price*self.slippage; self.trades+=1
+                self.cash-=cost; self.asset+=delta
+                # merge into average entry basis (cost basis includes fees)
+                self.basis_cost+=cost; self.basis_qty+=delta
+                self.fees+=gross*self.fee; self.slippage_paid+=delta*price*self.slippage; self.trades+=1
             else:
                 qty=-delta; gross=qty*price*(1-self.slippage); net=gross*(1-self.fee)
+                # realized round-trip P&L vs average entry basis (per-trade
+                # purity waterfall — metric_version 3)
+                avg=self.basis_cost/max(self.basis_qty,1e-12)
+                realized=net-qty*avg
+                self._record_realized(realized)
+                self.basis_cost-=qty*avg; self.basis_qty=max(0.0,self.basis_qty-qty)
+                if self.basis_qty<1e-12: self.basis_cost=0.0
                 self.asset-=qty; self.cash+=net; self.fees+=gross*self.fee; self.slippage_paid+=qty*price*self.slippage; self.trades+=1
         # entry happened? schedule timing evaluation (hindsight-clean)
         if self.asset > prev_asset + 1e-12:
@@ -351,7 +369,7 @@ class SpotTradingEnv(gym.Env):
         # ---------- reward = THE GENIUS DOCTRINE ----------
         base=float(np.log(max(new,1e-12)/max(old,1e-12)))
         bleed=self._bleed_penalty(new)
-        purity=self._track_waterfall(new, basis=old if self.hwm is None else None)
+        purity=self._purity_term()
         patience=self._trend_patience(old,new)
         inactivity=self._inactivity_bias()
         ambition=self._peak_ambition(new, prev_peak)
@@ -364,7 +382,6 @@ class SpotTradingEnv(gym.Env):
         info={"portfolio_value":new,"trades":self.trades,"fees":self.fees,
               "drawdown":self.max_drawdown,
               "position":self.asset*self.close[self.i]/max(new,1e-12),
-              "purity": ((self.gross_gain-self.gross_loss)/(self.gross_gain+self.gross_loss))
-                        if (self.gross_gain+self.gross_loss)>1e-12 else 0.0,
+              "purity":self._purity(),
               "gross_gain":self.gross_gain,"gross_loss":self.gross_loss,}
         return self._obs(),reward,terminated,truncated,info

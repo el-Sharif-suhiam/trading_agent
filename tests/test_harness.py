@@ -198,15 +198,15 @@ def test_paper_state_roundtrip(tmp_path):
     a.trade_to_target(0.9, 99.0)
     saved = {"cash": a.cash, "asset": a.asset, "peak": a.peak,
              "trades": a.trades, "fees_paid": a.fees_paid,
-             "slippage_paid": a.slippage_paid, "hwm": a.hwm,
-             "trough": a.trough, "gross_gain": a.gross_gain,
-             "gross_loss": a.gross_loss,
+             "slippage_paid": a.slippage_paid,
+             "basis_qty": a.basis_qty, "basis_cost": a.basis_cost,
+             "gross_gain": a.gross_gain, "gross_loss": a.gross_loss,
              "max_drawdown": a.max_drawdown, "steps": 3}
     b = LiveAccount(10000.0, fee=0.001, slippage=0.0005)
     b.cash = saved["cash"]; b.asset = saved["asset"]
     b.peak = saved["peak"]; b.trades = saved["trades"]
     b.fees_paid = saved["fees_paid"]; b.slippage_paid = saved["slippage_paid"]
-    b.hwm = saved["hwm"]; b.trough = saved["trough"]
+    b.basis_qty = saved["basis_qty"]; b.basis_cost = saved["basis_cost"]
     b.gross_gain = saved["gross_gain"]; b.gross_loss = saved["gross_loss"]
     b.max_drawdown = saved["max_drawdown"]
     # after restore, continuing trades gives identical results to never stopping

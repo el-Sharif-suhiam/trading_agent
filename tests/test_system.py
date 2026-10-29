@@ -390,19 +390,34 @@ def _run_env(e, start, action=1.0):
     return info
 
 
-def test_doctrine_punishes_big_loss_vs_gains():
-    """User's exact scenario: 1000 won then 800 lost must have worse purity
-    than 1000 won then 300 lost (holding through both).
-    reset(start=3) -> entry at close[3]; value marks at close[4..]."""
+def _run_scripted(e, actions, start):
+    """Run an env with a per-step action list (last action repeats)."""
     import numpy as np
-    # entry at 100, rises to 110 (+10% = +1000 on 10k), then:
-    # A: falls to 102 => L≈8%  (1000 gain / 800 loss)
-    pathA = [100.0]*1400 + [110.0, 106.0, 102.0, 102.0]
-    # B: falls to 107 => L≈3%  (1000 gain / 300 loss)
-    pathB = [100.0]*1400 + [110.0, 108.0, 107.0, 107.0]
-    iA = _run_env(_doctrine_env(pathA), start=1399)
-    iB = _run_env(_doctrine_env(pathB), start=1399)
-    assert iA["purity"] < iB["purity"], f"1000/800 (p={iA['purity']:.2f}) must be punished harder than 1000/300 (p={iB['purity']:.2f})"
+    e.reset(options={"start": start})
+    info = None
+    k = 0
+    while True:
+        _, _, t, tr, info = e.step(np.array([actions[min(k, len(actions)-1)]], np.float32))
+        k += 1
+        if t or tr: break
+    return info
+
+
+def test_doctrine_punishes_big_loss_vs_gains():
+    """User's exact scenario, PER-TRADE waterfall (mv3): two round-trips with
+    the same winning leg but different realized losses — the bigger loss must
+    produce worse purity. 1000/800 is GUILTY, 1000/300 is acceptable."""
+    import numpy as np
+    # scripted: buy@100, sell@110 (+10%), rebuy@110, sell after the drop.
+    # A drops to 102 (≈ −8% leg); B drops to 107 (−3% leg).
+    pathA = [100.0]*1400 + [110.0, 110.0, 102.0, 102.0]
+    pathB = [100.0]*1400 + [110.0, 110.0, 107.0, 107.0]
+    acts = [1.0, 0.0, 1.0, 0.0]
+    iA = _run_scripted(_doctrine_env(pathA), acts, start=1399)
+    iB = _run_scripted(_doctrine_env(pathB), acts, start=1399)
+    assert iA["purity"] < iB["purity"], (
+        f"1000/800 (p={iA['purity']:.2f}) must be punished harder than "
+        f"1000/300 (p={iB['purity']:.2f})")
 
 
 def test_doctrine_bleed_penalty_grows_with_drawdown():
@@ -410,7 +425,7 @@ def test_doctrine_bleed_penalty_grows_with_drawdown():
     e = _doctrine_env([100.0] * 1410)
     e.reset(options={"start": 1399})
     # simulate peak rising first (as if portfolio climbed), then test depths
-    e.peak = 100.0; e.hwm = 100.0; e.trough = 100.0
+    e.peak = 100.0
     p0 = e._bleed_penalty(100.0)      # no drawdown -> 0
     p_small = e._bleed_penalty(99.6)  # 0.4% dip -> below bleed_start(0.5%) -> 0
     p_mid = e._bleed_penalty(97.0)    # 3% dip -> some penalty
@@ -420,11 +435,30 @@ def test_doctrine_bleed_penalty_grows_with_drawdown():
 
 
 def test_doctrine_equal_gain_loss_scores_worst():
-    """gain == loss must yield purity ~0, worse than any profitable ratio."""
+    """A trade mix whose realized gain equals its realized loss must yield
+    purity ~0 — worse than any net-winning mix (per-trade waterfall, mv3)."""
     import numpy as np
-    e = _doctrine_env([100.0] * 1400 + [110.0, 105.0, 100.0])  # +10% then full retrace
-    info = _run_env(e, start=1399)
-    assert abs(info["purity"]) < 0.35, f"equal gain and loss must be ~purity 0, got {info['purity']}"
+    # +10% round-trip then an equal −10% round-trip at the same level
+    path = [100.0]*1400 + [110.0, 110.0, 100.0, 100.0]
+    acts = [1.0, 0.0, 1.0, 0.0]
+    info = _run_scripted(_doctrine_env(path), acts, start=1399)
+    assert abs(info["purity"]) < 0.15, f"equal gain/loss must be ~purity 0, got {info['purity']}"
+
+
+def test_doctrine_trade_level_purity_semantics():
+    """mv3 per-trade waterfall basics: no closed trades -> 0; one winning
+    round-trip -> +1; one losing round-trip -> -1."""
+    import numpy as np
+    win_path = [100.0]*1400 + [110.0, 110.0]
+    iw = _run_scripted(_doctrine_env(win_path), [1.0, 0.0], start=1399)
+    assert iw["purity"] > 0.9, f"single winning round-trip must score ~+1, got {iw['purity']}"
+    lose_path = [100.0]*1400 + [95.0, 95.0]
+    il = _run_scripted(_doctrine_env(lose_path), [1.0, 0.0], start=1399)
+    assert il["purity"] < -0.9, f"single losing round-trip must score ~-1, got {il['purity']}"
+    # no trades at all -> purity 0 by definition
+    e = _doctrine_env([100.0]*1410)
+    _run_env(e, start=1399, action=0.0)
+    assert e.gross_gain + e.gross_loss == 0.0
 
 
 def test_crisis_sampling_finds_crashes():

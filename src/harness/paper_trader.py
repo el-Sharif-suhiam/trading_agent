@@ -142,7 +142,8 @@ class PaperTrader:
             a.cash = acc["cash"]; a.asset = acc["asset"]
             a.peak = acc["peak"]; a.trades = acc["trades"]
             a.fees_paid = acc["fees_paid"]; a.slippage_paid = acc["slippage_paid"]
-            a.hwm = acc.get("hwm"); a.trough = acc.get("trough")
+            a.basis_qty = acc.get("basis_qty", 0.0)
+            a.basis_cost = acc.get("basis_cost", 0.0)
             a.gross_gain = acc.get("gross_gain", 0.0)
             a.gross_loss = acc.get("gross_loss", 0.0)
             a.max_drawdown = acc.get("max_drawdown", 0.0)
@@ -160,8 +161,9 @@ class PaperTrader:
             accounts[sym] = {
                 "cash": a.cash, "asset": a.asset, "peak": a.peak,
                 "trades": a.trades, "fees_paid": a.fees_paid,
-                "slippage_paid": a.slippage_paid, "hwm": a.hwm,
-                "trough": a.trough, "gross_gain": a.gross_gain,
+                "slippage_paid": a.slippage_paid,
+                "basis_qty": a.basis_qty, "basis_cost": a.basis_cost,
+                "gross_gain": a.gross_gain,
                 "gross_loss": a.gross_loss,
                 "max_drawdown": a.max_drawdown, "steps": env.steps,
             }

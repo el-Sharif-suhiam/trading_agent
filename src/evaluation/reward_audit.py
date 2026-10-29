@@ -51,7 +51,7 @@ def audit(model, cfg, train_ds, device, n_envs=16, steps=256):
                            ecstasy_scale=cfg.get("ecstasy_scale", 1.0))
         e.reset(seed=1, options={"start": s})
         envs.append(e)
-    TERM = {"bleed": "_bleed_penalty", "purity": "_track_waterfall",
+    TERM = {"bleed": "_bleed_penalty", "purity": "_purity_term",
             "patience": "_trend_patience", "inactivity": "_inactivity_bias",
             "ambition": "_peak_ambition", "ecstasy": "_ecstasy",
             "timing": "_resolve_timing", "survival": "_survival_check"}

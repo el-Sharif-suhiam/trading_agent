@@ -37,9 +37,11 @@ class LiveAccount:
         self.trades = 0
         self.fees_paid = 0.0
         self.slippage_paid = 0.0
-        # waterfall purity tracking (same as training env)
-        self.hwm = None
-        self.trough = None
+        # per-trade waterfall purity tracking (same as training env, mv3):
+        # average entry basis of the current position (cost incl. fees) and
+        # realized round-trip G/L accumulation
+        self.basis_qty = 0.0
+        self.basis_cost = 0.0
         self.gross_gain = 0.0
         self.gross_loss = 0.0
         self.max_drawdown = 0.0
@@ -72,6 +74,9 @@ class LiveAccount:
                 self.cash -= cost
                 self.asset += delta
                 executed = delta
+                # merge into average entry basis (identical to env.step())
+                self.basis_cost += cost
+                self.basis_qty += delta
                 self.fees_paid += gross * self.fee
                 self.slippage_paid += delta * price * self.slippage
                 self.trades += 1
@@ -79,30 +84,28 @@ class LiveAccount:
                 qty = -delta
                 gross = qty * price * (1 - self.slippage)
                 net = gross * (1 - self.fee)
+                # realized round-trip P&L vs average entry basis (identical
+                # to env.step() — the golden bit-for-bit parity depends on it)
+                avg = self.basis_cost / max(self.basis_qty, 1e-12)
+                realized = net - qty * avg
+                if realized > 0:
+                    self.gross_gain += realized
+                elif realized < 0:
+                    self.gross_loss += -realized
+                self.basis_cost -= qty * avg
+                self.basis_qty = max(0.0, self.basis_qty - qty)
+                if self.basis_qty < 1e-12:
+                    self.basis_cost = 0.0
                 self.asset -= qty
                 self.cash += net
                 executed = -qty
                 self.fees_paid += gross * self.fee
                 self.slippage_paid += qty * price * self.slippage
                 self.trades += 1
-        # waterfall purity bookkeeping on realized account value
         v = self.value(price)
-        self._track_waterfall(v)
         self.peak = max(self.peak, v)
         self.max_drawdown = min(self.max_drawdown, v / self.peak - 1.0)
         return executed
-
-    def _track_waterfall(self, value):
-        if self.hwm is None:
-            self.hwm = value
-            self.trough = value
-        elif value > self.hwm:
-            self.gross_gain += value - self.hwm
-            self.hwm = value
-            self.trough = value
-        elif value < self.trough:
-            self.gross_loss += self.trough - value
-            self.trough = value
 
     @property
     def purity(self):
@@ -171,7 +174,7 @@ class LiveEnv:
                   axis=0, out=env._csum)
         env._csum_lo = lo
         env._csum_valid = self.i
-        env.hwm = None; env.trough = None
+        env.basis_qty = 0.0; env.basis_cost = 0.0
         env.gross_gain = 0.0; env.gross_loss = 0.0
         env.ret_ema = 0.0
         env.peak_count = 0

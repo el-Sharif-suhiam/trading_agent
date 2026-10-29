@@ -12,7 +12,10 @@ from .evaluation import fair_eval
 
 
 class Trainer:
-    METRIC_VERSION = 2  # 2 = fair alpha protocol (segments); 1 = legacy full-split return
+    METRIC_VERSION = 3  # 2 = fair alpha; 3 = fair alpha + PER-TRADE purity
+                        # (old path-waterfall purity measured the market
+                        # regime, not the trader: buy-hold scored the same
+                        # -0.60 as the model and no segment ever went positive)
     def __init__(self, cfg, device=None, resume_path=""):
         self.cfg = cfg
         random.seed(cfg["seed"]); np.random.seed(cfg["seed"]); torch.manual_seed(cfg["seed"])
