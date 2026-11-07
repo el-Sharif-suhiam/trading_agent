@@ -1,13 +1,57 @@
+# ============================================================================
+# .gitignore — trading-agent-final
+# القاعدة: الكود والتوثيق والإعدادات تُرفع. البيانات والنماذج والسجلات تبقى
+# محلية (ضخمة/متغيرة/قابلة لإعادة البناء: src.data download + src.dataset).
+# ============================================================================
+
+# ---- Python ----
 .venv/
+venv/
 __pycache__/
-*.pyc
-data/raw/*.csv
-data/raw/.collector.lock
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- project data (huge, reproducible) ----
+data/raw/
 data/processed/*.csv
 data/processed/*.joblib
+# meta.json only (split layout doc) stays tracked
+
+# ---- models (22MB checkpoints churn history; rebuild/resume is local) ----
 models/*.pt
-logs/*.log
-logs/state.json
 models/bench/
-logs/bench/
+
+# ---- logs & runtime state ----
 logs/
+*.log
+logs/paper/
+logs/STOP
+logs/STOP_LIVE
+*.tmp
+
+# ---- SECRETS: never in git (future live phase: API keys, wallets) ----
+.env
+.env.*
+*.pem
+*.key
+secrets/
+credentials*.json
+*apikey*
+keys/
+
+# ---- OS / editor noise ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# NOTE: ___open000code.jsonc (OpenCode MCP wiring) stays TRACKED on purpose.
